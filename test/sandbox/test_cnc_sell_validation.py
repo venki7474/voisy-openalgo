@@ -4,6 +4,8 @@ Test CNC SELL validation - ensures CNC sell orders are only allowed with existin
 MIS orders allow short selling (negative positions)
 """
 import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from decimal import Decimal
 from database.sandbox_db import init_db, db_session, SandboxOrders, SandboxPositions, SandboxHoldings, SandboxFunds
 from sandbox.order_manager import OrderManager

@@ -44,7 +44,7 @@ class Strategy(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String(255), nullable=False)
     webhook_id = Column(String(36), unique=True, nullable=False)  # UUID
-    user_id = Column(String(255), nullable=False)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
     platform = Column(String(50), nullable=False, default='tradingview')  # Platform type (tradingview, chartink, etc)
     is_active = Column(Boolean, default=True)
     is_intraday = Column(Boolean, default=True)
@@ -56,6 +56,7 @@ class Strategy(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     
     # Relationships
+    user = relationship("User", backref="strategies")
     symbol_mappings = relationship("StrategySymbolMapping", back_populates="strategy", cascade="all, delete-orphan")
 
 class StrategySymbolMapping(Base):
@@ -107,12 +108,12 @@ def create_strategy(name, webhook_id, user_id, is_intraday=True, trading_mode='L
         db_session.rollback()
         return None
 
-def get_strategy(strategy_id):
-    """Get strategy by ID"""
+def get_strategy(user_id, strategy_id):
+    """Get strategy by ID for a specific user"""
     try:
-        return Strategy.query.get(strategy_id)
+        return Strategy.query.filter_by(user_id=user_id, id=strategy_id).first()
     except Exception as e:
-        logger.error(f"Error getting strategy {strategy_id}: {str(e)}")
+        logger.error(f"Error getting strategy {strategy_id} for user {user_id}: {str(e)}")
         return None
 
 def get_strategy_by_webhook_id(webhook_id):
@@ -130,14 +131,6 @@ def get_strategy_by_webhook_id(webhook_id):
     except Exception as e:
         logger.error(f"Error getting strategy by webhook ID {webhook_id}: {str(e)}")
         return None
-
-def get_all_strategies():
-    """Get all strategies"""
-    try:
-        return Strategy.query.all()
-    except Exception as e:
-        logger.error(f"Error getting all strategies: {str(e)}")
-        return []
 
 def get_user_strategies(user_id):
     """Get all strategies for a user (cached for 10 minutes)"""
@@ -158,16 +151,15 @@ def get_user_strategies(user_id):
         logger.error(f"Error getting user strategies for {user_id}: {str(e)}")
         return []
 
-def delete_strategy(strategy_id):
-    """Delete strategy and its symbol mappings"""
+def delete_strategy(user_id, strategy_id):
+    """Delete strategy and its symbol mappings for a specific user"""
     try:
-        strategy = get_strategy(strategy_id)
+        strategy = get_strategy(user_id, strategy_id)
         if not strategy:
             return False
 
         # Invalidate caches before deletion
         webhook_id = strategy.webhook_id
-        user_id = strategy.user_id
 
         db_session.delete(strategy)
         db_session.commit()
@@ -181,14 +173,14 @@ def delete_strategy(strategy_id):
 
         return True
     except Exception as e:
-        logger.error(f"Error deleting strategy {strategy_id}: {str(e)}")
+        logger.error(f"Error deleting strategy {strategy_id} for user {user_id}: {str(e)}")
         db_session.rollback()
         return False
 
-def toggle_strategy(strategy_id):
-    """Toggle strategy active status"""
+def toggle_strategy(user_id, strategy_id):
+    """Toggle strategy active status for a specific user"""
     try:
-        strategy = get_strategy(strategy_id)
+        strategy = get_strategy(user_id, strategy_id)
         if not strategy:
             return None
         
@@ -196,14 +188,14 @@ def toggle_strategy(strategy_id):
         db_session.commit()
         return strategy
     except Exception as e:
-        logger.error(f"Error toggling strategy {strategy_id}: {str(e)}")
+        logger.error(f"Error toggling strategy {strategy_id} for user {user_id}: {str(e)}")
         db_session.rollback()
         return None
 
-def update_strategy_times(strategy_id, start_time=None, end_time=None, squareoff_time=None):
-    """Update strategy trading times"""
+def update_strategy_times(user_id, strategy_id, start_time=None, end_time=None, squareoff_time=None):
+    """Update strategy trading times for a specific user"""
     try:
-        strategy = Strategy.query.get(strategy_id)
+        strategy = get_strategy(user_id, strategy_id)
         if strategy:
             if start_time is not None:
                 strategy.start_time = start_time
@@ -215,7 +207,7 @@ def update_strategy_times(strategy_id, start_time=None, end_time=None, squareoff
             return True
         return False
     except Exception as e:
-        logger.error(f"Error updating strategy times {strategy_id}: {str(e)}")
+        logger.error(f"Error updating strategy times {strategy_id} for user {user_id}: {str(e)}")
         db_session.rollback()
         return False
 

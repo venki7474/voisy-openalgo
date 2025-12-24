@@ -3,6 +3,8 @@
 Test script to verify margin calculations in all scenarios
 """
 import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import time
 from decimal import Decimal
 from database.sandbox_db import init_db, db_session, SandboxFunds, SandboxOrders, SandboxPositions, SandboxTrades

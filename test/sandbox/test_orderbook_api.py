@@ -2,6 +2,9 @@
 """
 Test that rejected orders appear correctly in the orderbook API response
 """
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from decimal import Decimal
 from database.sandbox_db import init_db, db_session, SandboxOrders
 from sandbox.order_manager import OrderManager

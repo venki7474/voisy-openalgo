@@ -1,21 +1,25 @@
 import httpx
-import os
 import requests
 import hashlib
 from utils.httpx_client import get_httpx_client
 from broker.iifl.baseurl import INTERACTIVE_URL, MARKET_DATA_URL
 from utils.logging import get_logger
+from database.broker_db import get_broker
 
 logger = get_logger(__name__)
 
 
-def authenticate_broker(request_token):
+def authenticate_broker(user_id, request_token):
     try:
         # Get the shared httpx client
         client = get_httpx_client()
-        # Fetching the necessary credentials from environment variables
-        BROKER_API_KEY = os.getenv('BROKER_API_KEY')
-        BROKER_API_SECRET = os.getenv('BROKER_API_SECRET')
+        # Fetching the necessary credentials from the database
+        broker_config = get_broker(user_id, 'iifl')
+        if not broker_config:
+            return None, None, None, "Broker configuration not found for user."
+
+        BROKER_API_KEY = broker_config.get('api_key')
+        BROKER_API_SECRET = broker_config.get('api_secret')
 
         
         # Make POST request to get the final token
@@ -40,11 +44,11 @@ def authenticate_broker(request_token):
                 logger.info(f"Auth Token: {token}")
 
                 # Call get_feed_token() after successful authentication
-                feed_token, user_id, feed_error = get_feed_token()
+                feed_token, feed_user_id, feed_error = get_feed_token(user_id)
                 if feed_error:
                     return token, None, None, f"Feed token error: {feed_error}"
 
-                return token, feed_token, user_id, None
+                return token, feed_token, feed_user_id, None
 
             else:
                 # Access token not present in the response
@@ -59,11 +63,16 @@ def authenticate_broker(request_token):
         return None, None, None, f"Error during authentication: {str(e)}"
 
 
-def get_feed_token():
+def get_feed_token(user_id):
     try:
         # Fetch credentials for feed token
-        BROKER_API_KEY_MARKET = os.getenv('BROKER_API_KEY_MARKET')
-        BROKER_API_SECRET_MARKET = os.getenv('BROKER_API_SECRET_MARKET')
+        broker_config = get_broker(user_id, 'iifl')
+        if not broker_config:
+            return None, None, "Broker configuration not found for user."
+
+        BROKER_API_KEY_MARKET = broker_config.get('api_key')
+        BROKER_API_SECRET_MARKET = broker_config.get('api_secret')
+
 
         # Construct payload for feed token request
         feed_payload = {

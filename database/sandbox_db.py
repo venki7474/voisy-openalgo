@@ -1,8 +1,8 @@
 # database/sandbox_db.py
 
 import os
-from sqlalchemy import create_engine, UniqueConstraint, Index, CheckConstraint
-from sqlalchemy.orm import scoped_session, sessionmaker
+from sqlalchemy import create_engine, UniqueConstraint, Index, CheckConstraint, ForeignKey
+from sqlalchemy.orm import scoped_session, sessionmaker, relationship
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean, DECIMAL, Date
 from sqlalchemy.sql import func
@@ -49,7 +49,7 @@ class SandboxOrders(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     orderid = Column(String(50), unique=True, nullable=False, index=True)
-    user_id = Column(String(50), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     strategy = Column(String(100), nullable=True)
     symbol = Column(String(50), nullable=False, index=True)
     exchange = Column(String(20), nullable=False, index=True)
@@ -68,6 +68,8 @@ class SandboxOrders(Base):
     order_timestamp = Column(DateTime, nullable=False, default=func.now())
     update_timestamp = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
 
+    user = relationship("User", backref="sandbox_orders")
+
     __table_args__ = (
         Index('idx_user_status', 'user_id', 'order_status'),
         Index('idx_symbol_exchange', 'symbol', 'exchange'),
@@ -85,7 +87,7 @@ class SandboxTrades(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     tradeid = Column(String(50), unique=True, nullable=False, index=True)
     orderid = Column(String(50), nullable=False, index=True)
-    user_id = Column(String(50), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     symbol = Column(String(50), nullable=False, index=True)
     exchange = Column(String(20), nullable=False, index=True)
     action = Column(String(10), nullable=False)  # BUY or SELL
@@ -94,6 +96,8 @@ class SandboxTrades(Base):
     product = Column(String(20), nullable=False)  # CNC, NRML, MIS
     strategy = Column(String(100), nullable=True)
     trade_timestamp = Column(DateTime, nullable=False, default=func.now())
+
+    user = relationship("User", backref="sandbox_trades")
 
     __table_args__ = (
         Index('idx_user_symbol', 'user_id', 'symbol'),
@@ -106,7 +110,7 @@ class SandboxPositions(Base):
     __tablename__ = 'sandbox_positions'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(String(50), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     symbol = Column(String(50), nullable=False, index=True)
     exchange = Column(String(20), nullable=False, index=True)
     product = Column(String(20), nullable=False)  # CNC, NRML, MIS
@@ -127,6 +131,8 @@ class SandboxPositions(Base):
     created_at = Column(DateTime, nullable=False, default=func.now())
     updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
 
+    user = relationship("User", backref="sandbox_positions")
+
     __table_args__ = (
         UniqueConstraint('user_id', 'symbol', 'exchange', 'product', name='unique_position'),
         Index('idx_user_product', 'user_id', 'product'),
@@ -138,7 +144,7 @@ class SandboxHoldings(Base):
     __tablename__ = 'sandbox_holdings'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(String(50), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     symbol = Column(String(50), nullable=False, index=True)
     exchange = Column(String(20), nullable=False, index=True)
     quantity = Column(Integer, nullable=False)  # Total holdings quantity
@@ -156,6 +162,8 @@ class SandboxHoldings(Base):
     created_at = Column(DateTime, nullable=False, default=func.now())
     updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
 
+    user = relationship("User", backref="sandbox_holdings")
+
     __table_args__ = (
         UniqueConstraint('user_id', 'symbol', 'exchange', name='unique_holding'),
     )
@@ -166,7 +174,7 @@ class SandboxFunds(Base):
     __tablename__ = 'sandbox_funds'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(String(50), unique=True, nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), unique=True, nullable=False, index=True)
 
     # Fund balances
     total_capital = Column(DECIMAL(15, 2), default=10000000.00)  # ₹1 Crore starting capital
@@ -185,6 +193,8 @@ class SandboxFunds(Base):
     # Timestamps
     created_at = Column(DateTime, nullable=False, default=func.now())
     updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
+
+    user = relationship("User", backref="sandbox_funds")
 
 
 class SandboxConfig(Base):

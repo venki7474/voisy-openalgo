@@ -15,7 +15,7 @@ import os
 from decimal import Decimal
 
 # Add parent directories to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sandbox.fund_manager import FundManager, get_user_funds, initialize_user_funds
 from database.sandbox_db import SandboxFunds, db_session
