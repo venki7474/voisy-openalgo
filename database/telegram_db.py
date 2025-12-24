@@ -82,8 +82,8 @@ class TelegramUser(Base):
     __tablename__ = 'telegram_users'
 
     id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
     telegram_id = Column(Integer, unique=True, nullable=False, index=True)
-    openalgo_username = Column(String(255), nullable=False, index=True)
     encrypted_api_key = Column(Text)  # Encrypted API key for secure storage
     host_url = Column(String(500))  # OpenAlgo host URL
     first_name = Column(String(255))
@@ -97,6 +97,7 @@ class TelegramUser(Base):
     last_command_at = Column(DateTime)
 
     # Relationships
+    user = relationship("User", backref="telegram_user")
     command_logs = relationship("CommandLog", back_populates="user", cascade="all, delete-orphan")
     notifications = relationship("NotificationQueue", back_populates="user", cascade="all, delete-orphan")
     preferences = relationship("UserPreference", back_populates="user", uselist=False, cascade="all, delete-orphan")
@@ -208,7 +209,7 @@ def get_telegram_user(telegram_id: int) -> Optional[Dict]:
             result = {
                 'id': user.id,
                 'telegram_id': user.telegram_id,
-                'openalgo_username': user.openalgo_username,
+                'user_id': user.user_id,
                 'first_name': user.first_name,
                 'last_name': user.last_name,
                 'telegram_username': user.telegram_username,
@@ -230,9 +231,9 @@ def get_telegram_user(telegram_id: int) -> Optional[Dict]:
         db_session.remove()
 
 
-def get_telegram_user_by_username(username: str) -> Optional[Dict]:
-    """Get telegram user by OpenAlgo username (cached for 30 minutes)"""
-    cache_key = f"username_{username}"
+def get_telegram_user_by_user_id(user_id: int) -> Optional[Dict]:
+    """Get telegram user by OpenAlgo user_id (cached for 30 minutes)"""
+    cache_key = f"user_id_{user_id}"
 
     # Check cache first
     if cache_key in _telegram_username_cache:
@@ -240,7 +241,7 @@ def get_telegram_user_by_username(username: str) -> Optional[Dict]:
 
     try:
         user = db_session.query(TelegramUser).filter_by(
-            openalgo_username=username,
+            user_id=user_id,
             is_active=True
         ).first()
 
@@ -248,7 +249,7 @@ def get_telegram_user_by_username(username: str) -> Optional[Dict]:
             result = {
                 'id': user.id,
                 'telegram_id': user.telegram_id,
-                'openalgo_username': user.openalgo_username,
+                'user_id': user.user_id,
                 'first_name': user.first_name,
                 'last_name': user.last_name,
                 'telegram_username': user.telegram_username,
@@ -264,13 +265,13 @@ def get_telegram_user_by_username(username: str) -> Optional[Dict]:
             return result
         return None
     except Exception as e:
-        logger.error(f"Failed to get telegram user by username: {str(e)}")
+        logger.error(f"Failed to get telegram user by user_id: {str(e)}")
         return None
     finally:
         db_session.remove()
 
 
-def create_or_update_telegram_user(telegram_id: int, username: str, api_key: str = None,
+def create_or_update_telegram_user(telegram_id: int, user_id: int, api_key: str = None,
                                   host_url: str = None, first_name: str = '',
                                   last_name: str = '', telegram_username: str = '',
                                   broker: str = 'default') -> bool:
@@ -285,7 +286,7 @@ def create_or_update_telegram_user(telegram_id: int, username: str, api_key: str
 
         if user:
             # Update existing user
-            user.openalgo_username = username
+            user.user_id = user_id
             if encrypted_key:
                 user.encrypted_api_key = encrypted_key
             if host_url:
@@ -300,7 +301,7 @@ def create_or_update_telegram_user(telegram_id: int, username: str, api_key: str
             # Create new user
             user = TelegramUser(
                 telegram_id=telegram_id,
-                openalgo_username=username,
+                user_id=user_id,
                 encrypted_api_key=encrypted_key,
                 host_url=host_url,
                 first_name=first_name,
@@ -319,12 +320,12 @@ def create_or_update_telegram_user(telegram_id: int, username: str, api_key: str
 
         # Invalidate caches for this user
         user_cache_key = f"user_{telegram_id}"
-        username_cache_key = f"username_{username}"
+        user_id_cache_key = f"user_id_{user_id}"
         creds_cache_key = f"creds_{telegram_id}"
         if user_cache_key in _telegram_user_cache:
             del _telegram_user_cache[user_cache_key]
-        if username_cache_key in _telegram_username_cache:
-            del _telegram_username_cache[username_cache_key]
+        if user_id_cache_key in _telegram_username_cache:
+            del _telegram_username_cache[user_id_cache_key]
         if creds_cache_key in _user_credentials_cache:
             del _user_credentials_cache[creds_cache_key]
 
@@ -344,7 +345,7 @@ def delete_telegram_user(telegram_id: int) -> bool:
         user = db_session.query(TelegramUser).filter_by(telegram_id=telegram_id).first()
 
         if user:
-            username = user.openalgo_username
+            user_id = user.user_id
             user.is_active = False
             user.updated_at = func.now()
             db_session.commit()
@@ -352,13 +353,13 @@ def delete_telegram_user(telegram_id: int) -> bool:
 
             # Invalidate caches for this user
             user_cache_key = f"user_{telegram_id}"
-            username_cache_key = f"username_{username}"
+            user_id_cache_key = f"user_id_{user_id}"
             creds_cache_key = f"creds_{telegram_id}"
             prefs_cache_key = f"prefs_{telegram_id}"
             if user_cache_key in _telegram_user_cache:
                 del _telegram_user_cache[user_cache_key]
-            if username_cache_key in _telegram_username_cache:
-                del _telegram_username_cache[username_cache_key]
+            if user_id_cache_key in _telegram_username_cache:
+                del _telegram_username_cache[user_id_cache_key]
             if creds_cache_key in _user_credentials_cache:
                 del _user_credentials_cache[creds_cache_key]
             if prefs_cache_key in _user_preferences_cache:
@@ -392,7 +393,7 @@ def get_all_telegram_users(filters: Optional[Dict] = None) -> List[Dict]:
         return [{
             'id': user.id,
             'telegram_id': user.telegram_id,
-            'openalgo_username': user.openalgo_username,
+            'user_id': user.user_id,
             'first_name': user.first_name,
             'last_name': user.last_name,
             'telegram_username': user.telegram_username,
@@ -755,7 +756,7 @@ def get_user_credentials(telegram_id: int) -> Optional[Dict]:
                     logger.error(f"Failed to decrypt API key: {str(e)}")
 
             result = {
-                'username': user.openalgo_username,
+                'username': user.user.username,
                 'api_key': api_key,
                 'host_url': user.host_url or os.getenv('HOST_SERVER', 'http://127.0.0.1:5000'),
                 'broker': user.broker
@@ -769,13 +770,6 @@ def get_user_credentials(telegram_id: int) -> Optional[Dict]:
         return None
     finally:
         db_session.remove()
-
-
-# Helper function to get auth token
-def get_auth_token_by_username(username: str):
-    """Helper function to get auth token - imports here to avoid circular imports"""
-    from database.auth_db import get_auth_token
-    return get_auth_token(username)
 
 
 def clear_telegram_cache():

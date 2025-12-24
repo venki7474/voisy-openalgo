@@ -2,8 +2,8 @@
 
 import os
 import json
-from sqlalchemy import create_engine, Column, Integer, DateTime, Text
-from sqlalchemy.orm import scoped_session, sessionmaker
+from sqlalchemy import create_engine, Column, Integer, DateTime, Text, ForeignKey
+from sqlalchemy.orm import scoped_session, sessionmaker, relationship
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
 from sqlalchemy.pool import NullPool
@@ -41,10 +41,13 @@ Base.query = db_session.query_property()
 class OrderLog(Base):
     __tablename__ = 'order_logs'
     id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
     api_type = Column(Text, nullable=False)
     request_data = Column(Text, nullable=False)
     response_data = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), default=func.now())
+
+    user = relationship("User", backref="order_logs")
 
 def init_db():
     from database.db_init_helper import init_db_with_logging
@@ -55,7 +58,7 @@ def init_db():
 # Executor for asynchronous tasks
 executor = ThreadPoolExecutor(10)  # Increased from 2 to 10 for better concurrency
 
-def async_log_order(api_type,request_data, response_data):
+def async_log_order(user_id, api_type,request_data, response_data):
     try:
         # Serialize JSON data for storage
         request_json = json.dumps(request_data)
@@ -65,10 +68,14 @@ def async_log_order(api_type,request_data, response_data):
         ist = pytz.timezone('Asia/Kolkata')
         now_ist = datetime.now(ist)
 
-        order_log = OrderLog(api_type=api_type,request_data=request_json, response_data=response_json, created_at=now_ist)
+        order_log = OrderLog(user_id=user_id, api_type=api_type,request_data=request_json, response_data=response_json, created_at=now_ist)
         db_session.add(order_log)
         db_session.commit()
     except Exception as e:
         logger.error(f"Error saving order log: {e}")
     finally:
         db_session.remove()
+
+def get_order_logs(user_id):
+    """Retrieves all order logs for a specific user."""
+    return OrderLog.query.filter_by(user_id=user_id).order_by(OrderLog.created_at.desc()).all()

@@ -247,7 +247,7 @@ class TestActionCenterService:
         assert 'total_sell_orders' in stats, "Should have sell orders count"
 
 
-class TestIST Timestamps:
+class TestISTTimestamps:
     """Test IST timestamp functionality"""
 
     def test_created_at_ist_format(self):

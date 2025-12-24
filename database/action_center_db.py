@@ -2,8 +2,8 @@
 
 import os
 import json
-from sqlalchemy import create_engine, Index
-from sqlalchemy.orm import scoped_session, sessionmaker
+from sqlalchemy import create_engine, Index, ForeignKey
+from sqlalchemy.orm import scoped_session, sessionmaker, relationship
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy import Column, Integer, String, DateTime, Text
 from sqlalchemy.sql import func
@@ -51,7 +51,7 @@ class PendingOrder(Base):
     __tablename__ = 'pending_orders'
 
     id = Column(Integer, primary_key=True)
-    user_id = Column(String(255), nullable=False)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
     api_type = Column(String(50), nullable=False)
     order_data = Column(Text, nullable=False)
 
@@ -76,6 +76,8 @@ class PendingOrder(Base):
     # Broker execution tracking
     broker_order_id = Column(String(255))
     broker_status = Column(String(20))
+
+    user = relationship("User", backref="pending_orders")
 
     __table_args__ = (
         Index('idx_user_status', 'user_id', 'status'),
@@ -146,20 +148,21 @@ def get_pending_orders(user_id, status=None):
         logger.error(f"Error getting pending orders: {e}")
         return []
 
-def get_pending_order_by_id(order_id):
+def get_pending_order_by_id(user_id, order_id):
     """
-    Get a single pending order by ID
+    Get a single pending order by ID for a specific user
 
     Args:
+        user_id: User ID
         order_id: Order ID
 
     Returns:
         PendingOrder or None
     """
     try:
-        return PendingOrder.query.filter_by(id=order_id).first()
+        return PendingOrder.query.filter_by(user_id=user_id, id=order_id).first()
     except Exception as e:
-        logger.error(f"Error getting pending order by ID: {e}")
+        logger.error(f"Error getting pending order by ID for user {user_id}: {e}")
         return None
 
 def approve_pending_order(order_id, approved_by, user_id):
