@@ -8,19 +8,40 @@ services:
       - "${FLASK_PORT:-5000}:5000"
       - "${WEBSOCKET_PORT:-8765}:8765"
 
+    # persistent DB, strategies, logs + mount the host .env read-only so dotenv can read it
     volumes:
-      # --- BIND MOUNTS (Easily accessible on your VM) ---
-      - ./data/db:/app/db                 # Database files
-      - ./data/logs:/app/logs             # Web server logs
-      - ./data/log:/app/log               # App logic logs
-      - ./strategies:/app/strategies      # YOUR PYTHON CODE (Edit these here!)
-      - ./data/keys:/app/keys             # API Keys
-      - ./.env:/app/.env:ro               # Read-only env file
+      - openalgo_db:/app/db
+      - openalgo_log:/app/log            # Application logs (named volume)
+      - openalgo_strategies:/app/strategies  # Python strategies (named volume)
+      - openalgo_keys:/app/keys          # API keys/certificates (named volume)
+      - openalgo_tmp:/app/tmp            # Temporary directory for numba/scipy (named volume)
+      - ./.env:/app/.env:ro
 
     environment:
       - FLASK_ENV=${FLASK_ENV:-production}
       - FLASK_DEBUG=${FLASK_DEBUG:-0}
+
+    # Shared memory for scipy/numba operations
+    shm_size: '2gb'
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:5000/auth/check-setup"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
     restart: unless-stopped
 
-# We removed the 'volumes:' section at the bottom because we are 
-# using Bind Mounts (direct folder paths) instead of Named Volumes.
+# Define named volumes for persistence
+volumes:
+  openalgo_db:
+    driver: local
+  openalgo_log:
+    driver: local
+  openalgo_strategies:
+    driver: local
+  openalgo_keys:
+    driver: local
+  openalgo_tmp:
+    driver: local
