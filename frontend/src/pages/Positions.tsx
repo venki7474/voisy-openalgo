@@ -52,8 +52,9 @@ import {
 } from '@/components/ui/table'
 import { useLivePrice } from '@/hooks/useLivePrice'
 import { usePageVisibility } from '@/hooks/usePageVisibility'
-import { cn, sanitizeCSV } from '@/lib/utils'
+import { cn, makeFormatCurrency, sanitizeCSV } from '@/lib/utils'
 import { useAuthStore } from '@/stores/authStore'
+import { useSupportedExchanges } from '@/hooks/useSupportedExchanges'
 import { onModeChange } from '@/stores/themeStore'
 import type { Position } from '@/types/trading'
 
@@ -72,14 +73,6 @@ interface FilterState {
 interface Preferences {
   grouping: GroupingType
   filters: FilterState
-}
-
-function formatCurrency(value: number): string {
-  return new Intl.NumberFormat('en-IN', {
-    style: 'currency',
-    currency: 'INR',
-    minimumFractionDigits: 2,
-  }).format(value)
 }
 
 function parseSymbol(symbol: string, exchange: string) {
@@ -145,7 +138,9 @@ const PRODUCT_COLORS: Record<string, string> = {
 }
 
 export default function Positions() {
-  const { apiKey } = useAuthStore()
+  const { apiKey, user } = useAuthStore()
+  const { isCrypto } = useSupportedExchanges()
+  const formatCurrency = useMemo(() => makeFormatCurrency(user?.broker), [user?.broker])
   const [positions, setPositions] = useState<Position[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [isRefreshing, setIsRefreshing] = useState(false)
@@ -193,7 +188,6 @@ export default function Positions() {
           })
       }
     } catch (e) {
-      console.error('Error loading preferences:', e)
     }
   }, [])
 
@@ -263,12 +257,15 @@ export default function Positions() {
       setShowStaleWarning(true)
       fetchPositions()
       lastFetchRef.current = Date.now()
-
-      // Hide the warning after 5 seconds
-      const timeout = setTimeout(() => setShowStaleWarning(false), 5000)
-      return () => clearTimeout(timeout)
     }
   }, [wasHidden, isVisible, timeSinceHidden, fetchPositions])
+
+  // Auto-dismiss stale data warning after 5 seconds
+  useEffect(() => {
+    if (!showStaleWarning) return
+    const timeout = setTimeout(() => setShowStaleWarning(false), 5000)
+    return () => clearTimeout(timeout)
+  }, [showStaleWarning])
 
   // Listen for mode changes (live/analyze) and refresh data
   useEffect(() => {
@@ -385,9 +382,10 @@ export default function Positions() {
 
   // Calculate stats
   const stats = useMemo(() => {
-    const total = filteredPositions.length
     const long = filteredPositions.filter((p) => (p.quantity || 0) > 0).length
     const short = filteredPositions.filter((p) => (p.quantity || 0) < 0).length
+    // Only count positions with non-zero quantity as "open"
+    const total = long + short
     const totalPnl = filteredPositions.reduce((sum, p) => sum + (p.pnl || 0), 0)
     return { total, long, short, totalPnl }
   }, [filteredPositions])
@@ -444,13 +442,15 @@ export default function Positions() {
         position.product
       )
       if (response.status === 'success') {
-        // Toast handled by order_event socket
+        showToast.success(
+          response.message || `Position closed for ${position.symbol}`,
+          'positions'
+        )
         fetchPositions(true)
       } else {
         showToast.error(response.message || 'Failed to close position', 'positions')
       }
     } catch (err) {
-      console.error('Close position error:', err)
       showToast.error('Failed to close position', 'positions')
     }
   }
@@ -459,48 +459,58 @@ export default function Positions() {
     try {
       const response = await tradingApi.closeAllPositions()
       if (response.status === 'success') {
-        showToast.success('All positions closed', 'positions')
+        // Toast handled by close_position_event socket
         fetchPositions(true)
       } else {
         showToast.error(response.message || 'Failed to close all positions', 'positions')
       }
     } catch (err) {
-      console.error('Close all positions error:', err)
       showToast.error('Failed to close all positions', 'positions')
     }
   }
 
   const exportToCSV = () => {
-    const headers = [
-      'Symbol',
-      'Exchange',
-      'Product',
-      'Quantity',
-      'Avg Price',
-      'LTP',
-      'P&L',
-      'P&L %',
-    ]
-    const rows = filteredPositions.map((p) => [
-      sanitizeCSV(p.symbol),
-      sanitizeCSV(p.exchange),
-      sanitizeCSV(p.product),
-      sanitizeCSV(p.quantity),
-      sanitizeCSV(p.average_price),
-      sanitizeCSV(p.ltp),
-      sanitizeCSV(p.pnl),
-      sanitizeCSV(calculatePnlPercent(p)),
-    ])
+    if (filteredPositions.length === 0) {
+      showToast.error('No data to export', 'system')
+      return
+    }
 
-    const csv = [headers, ...rows].map((row) => row.join(',')).join('\n')
-    const blob = new Blob([csv], { type: 'text/csv' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `positions_${new Date().toISOString().split('T')[0]}.csv`
-    a.click()
-    // Revoke the object URL to free memory
-    URL.revokeObjectURL(url)
+    try {
+      const headers = [
+        'Symbol',
+        'Exchange',
+        ...(isCrypto ? [] : ['Product']),
+        'Quantity',
+        'Avg Price',
+        'LTP',
+        'P&L',
+        'P&L %',
+      ]
+      const rows = filteredPositions.map((p) => [
+        sanitizeCSV(p.symbol),
+        sanitizeCSV(p.exchange),
+        ...(isCrypto ? [] : [sanitizeCSV(p.product)]),
+        sanitizeCSV(p.quantity),
+        sanitizeCSV(p.average_price),
+        sanitizeCSV(p.ltp),
+        sanitizeCSV(p.pnl),
+        sanitizeCSV(calculatePnlPercent(p)),
+      ])
+
+      const csv = [headers, ...rows].map((row) => row.join(',')).join('\n')
+      const blob = new Blob([csv], { type: 'text/csv' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      const filename = `positions_${new Date().toISOString().split('T')[0]}.csv`
+      a.download = filename
+      a.click()
+      // Revoke the object URL to free memory
+      URL.revokeObjectURL(url)
+      showToast.success(`Downloaded ${filename}`, 'clipboard')
+    } catch {
+      showToast.error('Failed to export CSV', 'system')
+    }
   }
 
   const isProfit = (value: number) => value >= 0
@@ -676,6 +686,7 @@ export default function Positions() {
                 <div className="border-t" />
 
                 {/* Product Type */}
+                {!isCrypto && (
                 <div className="space-y-3">
                   <Label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                     Product Type
@@ -686,6 +697,7 @@ export default function Positions() {
                     <FilterChip type="product" value="NRML" label="NRML" />
                   </div>
                 </div>
+                )}
 
                 {/* Direction */}
                 <div className="space-y-3">
@@ -740,7 +752,7 @@ export default function Positions() {
 
           <AlertDialog>
             <AlertDialogTrigger asChild>
-              <Button variant="destructive" size="sm" disabled={positions.length === 0}>
+              <Button variant="destructive" size="sm" disabled={stats.total === 0}>
                 <X className="h-4 w-4 mr-2" />
                 Close All
               </Button>
@@ -749,7 +761,7 @@ export default function Positions() {
               <AlertDialogHeader>
                 <AlertDialogTitle>Close All Positions?</AlertDialogTitle>
                 <AlertDialogDescription>
-                  This will close all {positions.length} open positions at market price. This action
+                  This will close all {stats.total} open positions at market price. This action
                   cannot be undone.
                 </AlertDialogDescription>
               </AlertDialogHeader>
@@ -771,7 +783,7 @@ export default function Positions() {
               Grouped: {grouping === 'underlying' ? 'Underlying' : 'Underlying & Expiry'}
             </Badge>
           )}
-          {filters.product.map((v) => (
+          {!isCrypto && filters.product.map((v) => (
             <Badge
               key={v}
               variant="secondary"
@@ -869,7 +881,7 @@ export default function Positions() {
                   <TableRow>
                     <SortableHeader column={0} label="Symbol" className="w-[140px]" />
                     <TableHead className="w-[80px]">Exchange</TableHead>
-                    <TableHead className="w-[80px]">Product</TableHead>
+                    {!isCrypto && <TableHead className="w-[80px]">Product</TableHead>}
                     <SortableHeader column={3} label="Qty" className="w-[80px] text-right" />
                     <SortableHeader column={4} label="Avg Price" className="w-[120px] text-right" />
                     <TableHead className="w-[120px] text-right">LTP</TableHead>
@@ -912,7 +924,7 @@ export default function Positions() {
                               )}
                             >
                               {groupStats.totalPnl >= 0 ? '+' : ''}
-                              {groupStats.totalPnl.toFixed(2)}
+                              {formatCurrency(groupStats.totalPnl)}
                             </TableCell>
                             <TableCell
                               className={cn(
@@ -942,6 +954,7 @@ export default function Positions() {
                                   {position.exchange}
                                 </Badge>
                               </TableCell>
+                              {!isCrypto && (
                               <TableCell className="w-[80px]">
                                 <Badge
                                   variant="outline"
@@ -950,6 +963,7 @@ export default function Positions() {
                                   {position.product}
                                 </Badge>
                               </TableCell>
+                              )}
                               <TableCell
                                 className={cn(
                                   'w-[80px] text-right font-medium',
@@ -996,6 +1010,7 @@ export default function Positions() {
                                   size="sm"
                                   className="text-destructive hover:text-destructive hover:bg-destructive/10"
                                   onClick={() => handleClosePosition(position)}
+                                  aria-label={`Close ${position.symbol} position`}
                                 >
                                   <X className="h-4 w-4" />
                                 </Button>

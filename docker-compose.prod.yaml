@@ -46,18 +46,6 @@ services:
       start_period: 60s # Increased for first-time ARM compilation (Numba/cache)
 
     restart: unless-stopped
-  nginx:
-    image: nginx:stable-alpine
-    container_name: voisy_openalgo_proxy
-    ports:
-      - "80:80"
-      - "443:443"
-      - "81:81"
-    volumes:
-      - ./nginx/conf.d:/etc/nginx/conf.d:ro
-      - ./nginx/letsencrypt:/etc/letsencrypt
-    depends_on:
-      - openalgo
 # Define named volumes
 volumes:
   openalgo_db:

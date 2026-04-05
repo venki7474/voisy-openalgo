@@ -14,6 +14,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { JsonEditor } from '@/components/ui/json-editor'
+import { useSupportedExchanges } from '@/hooks/useSupportedExchanges'
 
 interface SearchResult {
   symbol: string
@@ -22,14 +23,7 @@ interface SearchResult {
   token: string
 }
 
-const EXCHANGES = [
-  { value: 'NSE', label: 'NSE' },
-  { value: 'NFO', label: 'NFO' },
-  { value: 'BSE', label: 'BSE' },
-  { value: 'BFO', label: 'BFO' },
-  { value: 'CDS', label: 'CDS' },
-  { value: 'MCX', label: 'MCX' },
-]
+// EXCHANGES is now dynamic — provided by useSupportedExchanges() hook
 
 const PRODUCTS = [
   { value: 'MIS', label: 'MIS - Intraday' },
@@ -38,10 +32,12 @@ const PRODUCTS = [
 ]
 
 export default function GoCharting() {
+  const { tradingExchanges, defaultExchange, isCrypto } = useSupportedExchanges()
+
   // Form state
-  const [symbol, setSymbol] = useState('NHPC')
-  const [exchange, setExchange] = useState('NSE')
-  const [product, setProduct] = useState('MIS')
+  const [symbol, setSymbol] = useState(isCrypto ? 'BTCUSDFUT' : 'NHPC')
+  const [exchange, setExchange] = useState(defaultExchange)
+  const [product, setProduct] = useState(isCrypto ? 'NRML' : 'MIS')
   const [action, setAction] = useState('BUY')
   const [quantity, setQuantity] = useState('1')
 
@@ -50,8 +46,18 @@ export default function GoCharting() {
   const [showResults, setShowResults] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
 
+  // Re-sync exchange when broker capabilities load asynchronously
+  useEffect(() => {
+    setExchange((prev) =>
+      prev && tradingExchanges.some((ex) => ex.value === prev) ? prev : defaultExchange
+    )
+  }, [defaultExchange, tradingExchanges])
+
   // JSON output
   const [generatedJson, setGeneratedJson] = useState<string>('')
+
+  // API key state
+  const [apiKey, setApiKey] = useState<string>('')
 
   // Host config state for webhook URL
   const [hostConfig, setHostConfig] = useState<{ host_server: string; is_localhost: boolean } | null>(null)
@@ -59,7 +65,7 @@ export default function GoCharting() {
   // Refs
   const inputWrapperRef = useRef<HTMLDivElement>(null)
 
-  // Fetch host configuration on mount
+  // Fetch host configuration and API key on mount
   useEffect(() => {
     const fetchHostConfig = async () => {
       try {
@@ -67,7 +73,6 @@ export default function GoCharting() {
         const data = await response.json()
         setHostConfig(data)
       } catch (error) {
-        console.error('Failed to fetch host config:', error)
         // Fallback to window.location.origin if config fetch fails
         setHostConfig({
           host_server: window.location.origin,
@@ -75,7 +80,19 @@ export default function GoCharting() {
         })
       }
     }
+    const fetchApiKey = async () => {
+      try {
+        const response = await fetch('/playground/api-key', { credentials: 'include' })
+        if (response.ok) {
+          const data = await response.json()
+          setApiKey(data.api_key || '')
+        }
+      } catch {
+        // Silently fail - API key may not exist yet
+      }
+    }
     fetchHostConfig()
+    fetchApiKey()
   }, [])
 
   // Get webhook URL from host config or fallback to window.location.origin
@@ -102,7 +119,6 @@ export default function GoCharting() {
         setSearchResults((data.results || []).slice(0, 10))
         setShowResults(true)
       } catch (error) {
-        console.error('Search error:', error)
         setSearchResults([])
       } finally {
         setIsLoading(false)
@@ -147,7 +163,7 @@ export default function GoCharting() {
     }
 
     const json = {
-      apikey: 'YOUR_API_KEY',
+      apikey: apiKey || 'YOUR_API_KEY',
       strategy: 'GoCharting Alert',
       symbol: symbol,
       exchange: exchange,
@@ -163,8 +179,7 @@ export default function GoCharting() {
   // Auto-generate JSON when values change
   useEffect(() => {
     generateJson(false)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [generateJson])
 
   const copyToClipboard = async (text: string, label: string) => {
     try {
@@ -284,7 +299,7 @@ export default function GoCharting() {
                     <SelectValue placeholder="Select Exchange" />
                   </SelectTrigger>
                   <SelectContent>
-                    {EXCHANGES.map((ex) => (
+                    {tradingExchanges.map((ex) => (
                       <SelectItem key={ex.value} value={ex.value}>
                         {ex.label}
                       </SelectItem>
@@ -293,22 +308,24 @@ export default function GoCharting() {
                 </Select>
               </div>
 
-              {/* Product Type */}
-              <div className="space-y-2">
-                <Label htmlFor="product">Product Type</Label>
-                <Select value={product} onValueChange={setProduct}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {PRODUCTS.map((p) => (
-                      <SelectItem key={p.value} value={p.value}>
-                        {p.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
+              {/* Product Type (hidden for crypto — Delta Exchange ignores it) */}
+              {!isCrypto && (
+                <div className="space-y-2">
+                  <Label htmlFor="product">Product Type</Label>
+                  <Select value={product} onValueChange={setProduct}>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {PRODUCTS.map((p) => (
+                        <SelectItem key={p.value} value={p.value}>
+                          {p.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
 
               {/* Action */}
               <div className="space-y-2">

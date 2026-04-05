@@ -22,7 +22,8 @@ import {
   Zap,
   ZapOff,
 } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useSupportedExchanges } from '@/hooks/useSupportedExchanges'
 import { showToast } from '@/utils/toast'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -35,7 +36,8 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
-import { cn } from '@/lib/utils'
+import { cn, makeFormatCurrency } from '@/lib/utils'
+import { useAuthStore } from '@/stores/authStore'
 
 async function fetchCSRFToken(): Promise<string> {
   const response = await fetch('/auth/csrf-token', { credentials: 'include' })
@@ -80,7 +82,7 @@ interface LogEntry {
   type: 'info' | 'success' | 'error' | 'data' | 'warn'
 }
 
-const EXCHANGES = ['NSE', 'NFO', 'BSE', 'BFO', 'CDS', 'MCX']
+// EXCHANGES is now dynamic — provided by useSupportedExchanges() hook
 
 function formatPrice(price: number): string {
   return new Intl.NumberFormat('en-IN', {
@@ -219,7 +221,11 @@ interface WebSocketTestProps {
 }
 
 export default function WebSocketTest({ depthLevel = 5 }: WebSocketTestProps) {
-  // Connection state
+  const { user } = useAuthStore()
+  const { tradingExchanges } = useSupportedExchanges()
+  const formatCurrency = useMemo(() => makeFormatCurrency(user?.broker), [user?.broker])
+  // Connection state - INDEPENDENT WebSocket (not shared with MarketDataManager)
+  // This page needs its own connection for testing/debugging purposes
   const [isConnected, setIsConnected] = useState(false)
   const [isConnecting, setIsConnecting] = useState(false)
   const [isAuthenticated, setIsAuthenticated] = useState(false)
@@ -540,7 +546,6 @@ export default function WebSocketTest({ depthLevel = 5 }: WebSocketTestProps) {
       setSearchResults((data.results || []).slice(0, 8))
       setShowSearchResults(true)
     } catch (err) {
-      console.debug('Symbol search failed:', err)
       setSearchResults([])
     } finally {
       setIsSearching(false)
@@ -636,7 +641,6 @@ export default function WebSocketTest({ depthLevel = 5 }: WebSocketTestProps) {
         })
         setActiveSymbols(newMap)
       } catch (err) {
-        console.debug('Failed to load saved symbols:', err)
       }
     }
   }, [])
@@ -691,7 +695,7 @@ export default function WebSocketTest({ depthLevel = 5 }: WebSocketTestProps) {
                   <p className="text-xs text-muted-foreground">
                     {depthLevel > 5
                       ? `${depthLevel}-level market depth testing (broker dependent)`
-                      : 'Real-time market data testing interface'}
+                      : 'Real-time market data testing interface (independent connection)'}
                   </p>
                 </div>
               </div>
@@ -837,9 +841,9 @@ export default function WebSocketTest({ depthLevel = 5 }: WebSocketTestProps) {
                 </SelectTrigger>
                 <SelectContent className="bg-card border-border">
                   <SelectItem value="_all">All Exchanges</SelectItem>
-                  {EXCHANGES.map((ex) => (
-                    <SelectItem key={ex} value={ex}>
-                      {ex}
+                  {tradingExchanges.map((ex) => (
+                    <SelectItem key={ex.value} value={ex.value}>
+                      {ex.label}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -1003,7 +1007,7 @@ export default function WebSocketTest({ depthLevel = 5 }: WebSocketTestProps) {
                           LTP
                         </div>
                         <div className="text-3xl font-bold font-mono tracking-tight">
-                          {hasLtp ? `₹${formatPrice(symbolData.data.ltp!)}` : '---'}
+                          {hasLtp ? formatCurrency(symbolData.data.ltp!) : '---'}
                         </div>
                       </div>
                       {hasLtp && (

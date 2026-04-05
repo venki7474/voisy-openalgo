@@ -152,6 +152,18 @@ class Auth(Base):
     user_id = Column(String(255), nullable=True)  # Add user_id column
     is_revoked = Column(Boolean, default=False)
 
+    # Samco 2FA fields
+    secret_api_key = Column(Text, nullable=True)
+    primary_ip = Column(String(45), nullable=True)
+    secondary_ip = Column(String(45), nullable=True)
+    ip_updated_at = Column(DateTime, nullable=True)
+
+    # Generic auxiliary fields for any broker needing extra storage
+    aux_param1 = Column(Text, nullable=True)
+    aux_param2 = Column(Text, nullable=True)
+    aux_param3 = Column(Text, nullable=True)
+    aux_param4 = Column(Text, nullable=True)
+
     # Performance indexes for frequently queried columns
     __table_args__ = (
         Index("idx_auth_broker", "broker"),  # Speeds up get_broker_name() queries
@@ -229,23 +241,16 @@ def upsert_auth(name, auth_token, broker, feed_token=None, user_id=None, revoke=
         db_session.add(auth_obj)
     db_session.commit()
 
-    # Update cache after successful database operation
-    cache_key_auth = f"auth-{name}"
-    cache_key_feed = f"feed-{name}"
-
-    if revoke:
-        # Clear cache entries when revoking
-        if cache_key_auth in auth_cache:
-            del auth_cache[cache_key_auth]
-        if cache_key_feed in feed_token_cache:
-            del feed_token_cache[cache_key_feed]
-        logger.info(f"Cleared cache entries for revoked tokens of user: {name}")
-    else:
-        # Populate cache immediately on login/update for faster subsequent access
-        auth_cache[cache_key_auth] = auth_obj
-        if auth_obj.feed_token:
-            feed_token_cache[cache_key_feed] = auth_obj
-        logger.debug(f"Auth cache populated for user: {name}")
+    # CRITICAL: Clear ENTIRE auth_cache on token update to prevent stale token issues
+    # This is necessary because get_auth_token_broker() uses a different cache key format
+    # (sha256(api_key)_include_feed_token) than upsert_auth() uses (auth-{name}).
+    # Without clearing all entries, old cached tokens from get_auth_token_broker()
+    # would persist and cause 401 Unauthorized errors after re-login.
+    # See GitHub issue #851 for details on this cache key mismatch bug.
+    auth_cache.clear()
+    feed_token_cache.clear()
+    broker_cache.clear()  # Also clear broker cache to ensure fresh data
+    logger.info(f"Cleared all auth caches after token update for user: {name}")
 
     # Publish cache invalidation event via ZeroMQ for other processes
     # This notifies WebSocket proxy and other processes to clear their stale caches
@@ -474,11 +479,21 @@ def get_first_available_api_key():
     """
     Get the first available decrypted API key from the database.
     Used for background services that don't have session context.
+
+    Only returns keys for users who have an active (non-revoked) auth session
+    with a broker configured. This prevents returning orphaned API keys for
+    deleted users or users with revoked sessions.
     """
     try:
-        api_key_obj = ApiKeys.query.first()
-        if api_key_obj and api_key_obj.api_key_encrypted:
-            return decrypt_token(api_key_obj.api_key_encrypted)
+        # Join api_keys with auth to only return keys for users with active sessions
+        api_keys = ApiKeys.query.all()
+        for api_key_obj in api_keys:
+            if not api_key_obj.api_key_encrypted:
+                continue
+            # Check if this user has an active auth session with a broker
+            auth_obj = Auth.query.filter_by(name=api_key_obj.user_id).first()
+            if auth_obj and not auth_obj.is_revoked and auth_obj.broker:
+                return decrypt_token(api_key_obj.api_key_encrypted)
         return None
     except Exception as e:
         logger.exception(f"Error getting first available API key: {e}")
@@ -649,8 +664,12 @@ def get_auth_token_broker(provided_api_key, include_feed_token=False):
                 logger.debug(f"Auth token cached for user_id: {user_id}")
                 return result
             else:
-                logger.warning(f"No valid auth token or broker found for user_id '{user_id}'.")
-                return (None, None, None) if include_feed_token else (None, None)
+                # Cache the negative result to prevent repeated DB queries and log spam
+                # (e.g., orphaned users with revoked sessions polled by background services)
+                negative_result = (None, None, None) if include_feed_token else (None, None)
+                auth_cache[cache_key] = negative_result
+                logger.warning(f"No valid auth token or broker found for user_id '{user_id}'. Cached negative result.")
+                return negative_result
         except Exception as e:
             logger.exception(f"Error while querying the database for auth token and broker: {e}")
             return (None, None, None) if include_feed_token else (None, None)
@@ -711,3 +730,117 @@ def update_order_mode(user_id, mode):
         logger.exception(f"Error updating order mode: {e}")
         db_session.rollback()
         return False
+
+
+# ============================================================
+# Samco 2FA Helper Functions
+# Uses dedicated columns on the Auth table:
+#   secret_api_key, primary_ip, secondary_ip, ip_updated_at
+# ============================================================
+
+
+def _get_samco_auth(user_id):
+    """Get the Auth record for a Samco user by name."""
+    try:
+        return Auth.query.filter_by(broker="samco", name=user_id).first()
+    except Exception as e:
+        logger.error(f"Error getting samco auth for {user_id}: {e}")
+        return None
+
+
+def samco_save_secret_key(user_id, secret_api_key):
+    """Save or update the secret API key for a Samco user.
+    Creates a placeholder auth record if one doesn't exist yet (pre-login setup).
+    """
+    try:
+        record = _get_samco_auth(user_id)
+        if not record:
+            record = Auth(
+                name=user_id,
+                auth="pending",
+                broker="samco",
+                is_revoked=True,
+            )
+            db_session.add(record)
+            logger.info(f"Created placeholder auth record for samco user {user_id}")
+        record.secret_api_key = secret_api_key
+        db_session.commit()
+        return True
+    except Exception as e:
+        db_session.rollback()
+        logger.error(f"Error saving secret key for {user_id}: {e}")
+        return False
+
+
+def samco_get_ip_status(user_id):
+    """Get IP registration status and whether editing is allowed."""
+    from datetime import datetime, timedelta
+
+    record = _get_samco_auth(user_id)
+    if not record:
+        return {
+            "primary_ip": None,
+            "secondary_ip": None,
+            "editable": True,
+            "ip_updated_at": None,
+            "next_editable_date": None,
+        }
+
+    editable = True
+    next_editable_date = None
+
+    if record.ip_updated_at:
+        now = datetime.utcnow()
+        unlock_date = record.ip_updated_at + timedelta(days=7)
+        if now < unlock_date:
+            editable = False
+            next_editable_date = unlock_date.strftime("%Y-%m-%d")
+
+    return {
+        "primary_ip": record.primary_ip,
+        "secondary_ip": record.secondary_ip,
+        "editable": editable,
+        "ip_updated_at": record.ip_updated_at.isoformat() if record.ip_updated_at else None,
+        "next_editable_date": next_editable_date,
+    }
+
+
+def samco_save_ip_info(user_id, primary_ip, secondary_ip=None, ip_updated_at=None):
+    """Save IP registration info for a Samco user."""
+    from datetime import datetime
+
+    try:
+        record = _get_samco_auth(user_id)
+        if record:
+            record.primary_ip = primary_ip
+            record.secondary_ip = secondary_ip
+            record.ip_updated_at = ip_updated_at or datetime.utcnow()
+            db_session.commit()
+            return True
+        else:
+            logger.error(f"No auth record found for samco user {user_id}")
+            return False
+    except Exception as e:
+        db_session.rollback()
+        logger.error(f"Error saving IP info for {user_id}: {e}")
+        return False
+
+
+def samco_has_secret_key(user_id):
+    """Check if a Samco user has a secret API key stored."""
+    record = _get_samco_auth(user_id)
+    return record is not None and record.secret_api_key is not None
+
+
+def samco_get_secret_key(user_id):
+    """Get the stored secret API key for a Samco user."""
+    record = _get_samco_auth(user_id)
+    if record and record.secret_api_key:
+        return record.secret_api_key
+    return None
+
+
+def samco_has_registered_ip(user_id):
+    """Check if a Samco user has registered IPs."""
+    record = _get_samco_auth(user_id)
+    return record is not None and record.primary_ip is not None

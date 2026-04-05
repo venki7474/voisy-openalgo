@@ -62,6 +62,7 @@ class DhanWebSocket:
         self.ws_thread = None
         self.running = False
         self.connected = False
+        self._was_connected = False  # tracks if connection was ever established
 
         # Callbacks
         self.on_open = None
@@ -73,6 +74,10 @@ class DhanWebSocket:
         # Subscription tracking
         self.subscriptions = {}
         self.lock = threading.Lock()
+
+        # Fatal error tracking (non-recoverable errors like expired subscription)
+        self._fatal_error = False
+        self._fatal_error_message = None
 
         # Logging
         self.logger = logging.getLogger(f"dhan_websocket_{'20depth' if is_20_depth else '5depth'}")
@@ -144,9 +149,6 @@ class DhanWebSocket:
 
         while self.running:
             try:
-                # self.logger.info(f"Connecting to Dhan WebSocket ({'20-depth' if self.is_20_depth else '5-depth'})...")
-                # self.logger.info(f"WebSocket URL: {self.ws_url}")
-
                 self.ws = websocket.WebSocketApp(
                     self.ws_url,
                     on_open=self._on_open,
@@ -164,25 +166,36 @@ class DhanWebSocket:
                 self.logger.error(f"WebSocket connection error: {e}", exc_info=True)
                 self.connected = False
 
-                if self.running:
-                    reconnect_attempt += 1
-                    if reconnect_attempt >= max_reconnect_attempts:
-                        self.logger.error(
-                            f"Maximum reconnection attempts ({max_reconnect_attempts}) reached. Stopping."
-                        )
-                        self.running = False
-                        break
+            # Check for fatal error - stop immediately without reconnecting
+            if self._fatal_error:
+                self.logger.error(
+                    f"Stopping WebSocket due to fatal error: {self._fatal_error_message}"
+                )
+                self.running = False
+                break
 
-                    # Calculate delay with exponential backoff
-                    delay = min(base_delay * (2 ** (reconnect_attempt - 1)), max_delay)
-                    self.logger.info(
-                        f"Reconnecting in {delay} seconds... (attempt {reconnect_attempt}/{max_reconnect_attempts})"
-                    )
-                    time.sleep(delay)
-            else:
-                # Reset reconnect attempt counter on successful connection
-                if self.connected:
+            if self.running:
+                # Reset counter if the connection was successfully established
+                # before it dropped. self.connected can't be used here because
+                # _on_close already set it to False before run_forever returned.
+                if self._was_connected:
                     reconnect_attempt = 0
+                    self._was_connected = False
+
+                reconnect_attempt += 1
+                if reconnect_attempt >= max_reconnect_attempts:
+                    self.logger.error(
+                        f"Maximum reconnection attempts ({max_reconnect_attempts}) reached. Stopping."
+                    )
+                    self.running = False
+                    break
+
+                # Calculate delay with exponential backoff
+                delay = min(base_delay * (2 ** (reconnect_attempt - 1)), max_delay)
+                self.logger.info(
+                    f"Reconnecting in {delay} seconds... (attempt {reconnect_attempt}/{max_reconnect_attempts})"
+                )
+                time.sleep(delay)
 
     def disconnect(self):
         """Disconnect from WebSocket with proper resource cleanup"""
@@ -301,17 +314,55 @@ class DhanWebSocket:
     def _on_open(self, ws):
         """Handle WebSocket connection open"""
         self.connected = True
+        self._was_connected = True
         self.logger.debug("WebSocket connection established")
 
         if self.on_open:
             self.on_open(self)
 
     def _on_error(self, ws, error):
-        """Handle WebSocket errors"""
+        """Handle WebSocket errors with detection of fatal/non-recoverable errors"""
+        error_str = str(error)
         self.logger.error(f"WebSocket error: {error}")
+
+        # Detect fatal errors that should stop reconnection
+        if self._is_fatal_error(error_str):
+            self._fatal_error = True
+            self._fatal_error_message = self._get_fatal_error_message(error_str)
+            self.logger.error(
+                f"Fatal WebSocket error detected - stopping reconnection. "
+                f"Reason: {self._fatal_error_message}"
+            )
+            self.running = False  # Stop the reconnection loop
 
         if self.on_error:
             self.on_error(self, error)
+
+    def _is_fatal_error(self, error_str: str) -> bool:
+        """Check if a WebSocket error is fatal (non-recoverable)"""
+        error_lower = error_str.lower()
+        fatal_indicators = [
+            "429",                          # HTTP 429 Too Many Requests
+            "too many requests",            # Rate limited / subscription expired
+            "client id is blocked",         # IP/client blocked by Dhan
+            "subscription",                 # Subscription related errors
+            "plan",                         # Plan/subscription expired
+        ]
+        return any(indicator in error_lower for indicator in fatal_indicators)
+
+    def _get_fatal_error_message(self, error_str: str) -> str:
+        """Get a user-friendly message for fatal WebSocket errors"""
+        error_lower = error_str.lower()
+
+        if "429" in error_lower or "too many requests" in error_lower or "client id is blocked" in error_lower:
+            return (
+                "Dhan WebSocket connection blocked (HTTP 429 - Too Many Requests). "
+                "This usually means your Dhan data subscription has expired or is inactive. "
+                "Please check your Dhan data subscription status at https://dhan.co and ensure "
+                "you have an active market data subscription plan."
+            )
+
+        return f"Dhan WebSocket fatal error: {error_str}"
 
     def _on_close(self, ws, close_status_code, close_msg):
         """Handle WebSocket connection close"""
@@ -401,8 +452,11 @@ class DhanWebSocket:
             elif feed_response_code == 50:  # Disconnect
                 self.logger.debug("Parsing DISCONNECT packet")
                 self._handle_disconnect_packet(payload)
+            elif feed_response_code == 0:
+                # Response code 0 is a heartbeat/acknowledgment from Dhan - silently ignore
+                pass
             else:
-                self.logger.warning(f"Unknown feed response code: {feed_response_code}")
+                self.logger.debug(f"Unknown feed response code: {feed_response_code}")
 
             if parsed_data and self.on_data:
                 self.logger.debug(f"Sending parsed data to callback: {parsed_data.get('type')}")
@@ -454,8 +508,11 @@ class DhanWebSocket:
                     self.on_data(self, parsed_data)
                 else:
                     self.logger.warning(f"Failed to parse 20-depth {side} data")
+            elif feed_response_code == 0:
+                # Response code 0 is a heartbeat/acknowledgment from Dhan - silently ignore
+                pass
             else:
-                self.logger.warning(f"Unknown 20-depth response code: {feed_response_code}")
+                self.logger.debug(f"Unknown 20-depth response code: {feed_response_code}")
 
             # Move to next message
             offset = payload_end

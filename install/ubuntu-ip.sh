@@ -52,8 +52,8 @@ generate_hex() {
 # Function to validate broker
 validate_broker() {
     local broker=$1
-    local valid_brokers="fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,jainamxts,kotak,motilal,mstock,paytm,pocketful,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha"
-    if [[ $valid_brokers == *"$broker"* ]]; then
+    local valid_brokers="fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha"
+    if [[ ",$valid_brokers," == *",$broker,"* ]]; then
         return 0
     else
         return 1
@@ -63,8 +63,8 @@ validate_broker() {
 # Function to check XTS broker
 is_xts_broker() {
     local broker=$1
-    local xts_brokers="fivepaisaxts,compositedge,ibulls,iifl,jainamxts,wisdom"
-    if [[ $xts_brokers == *"$broker"* ]]; then
+    local xts_brokers="fivepaisaxts,compositedge,ibulls,iifl,jainamxts,rmoney,wisdom"
+    if [[ ",$xts_brokers," == *",$broker,"* ]]; then
         return 0
     else
         return 1
@@ -208,7 +208,7 @@ log_message "----------------------------------------" "$BLUE"
 
 # Get broker name
 while true; do
-    log_message "\nValid brokers: fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,jainamxts,kotak,motilal,mstock,paytm,pocketful,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha" "$BLUE"
+    log_message "\nValid brokers: fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha" "$BLUE"
     read -p "Enter your broker name: " BROKER_NAME
     if validate_broker "$BROKER_NAME"; then
         break
@@ -351,7 +351,7 @@ check_status "Failed to install dependencies"
 
 # Ensure gunicorn and eventlet are installed
 log_message "Ensuring gunicorn and eventlet are installed..." "$BLUE"
-sudo bash -c "$ACTIVATE_CMD && uv pip install gunicorn eventlet"
+sudo bash -c "$ACTIVATE_CMD && uv pip install 'gunicorn>=25.0,<26' eventlet"
 check_status "Failed to install gunicorn/eventlet"
 
 # Configure .env file
@@ -394,6 +394,13 @@ Environment="TMPDIR=$BASE_PATH/tmp"
 Environment="NUMBA_CACHE_DIR=$BASE_PATH/tmp/numba_cache"
 Environment="LLVMLITE_TMPDIR=$BASE_PATH/tmp"
 Environment="MPLCONFIGDIR=$BASE_PATH/tmp/matplotlib"
+# Thread limits for OpenBLAS/NumPy to prevent RLIMIT_NPROC issues
+# See: https://github.com/marketcalls/openalgo/issues/822
+Environment="OPENBLAS_NUM_THREADS=2"
+Environment="OMP_NUM_THREADS=2"
+Environment="MKL_NUM_THREADS=2"
+Environment="NUMEXPR_NUM_THREADS=2"
+Environment="NUMBA_NUM_THREADS=2"
 ExecStart=$VENV_PATH/bin/gunicorn --worker-class eventlet -w 1 --bind 0.0.0.0:80 --timeout 300 app:app
 Restart=always
 RestartSec=5

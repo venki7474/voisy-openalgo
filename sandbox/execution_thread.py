@@ -57,7 +57,7 @@ class ExecutionEngineThread(threading.Thread):
                     break
                 time.sleep(1)
 
-        logger.info("Sandbox Execution Engine thread stopped")
+        logger.debug("Sandbox Execution Engine thread stopped")
 
     def stop(self):
         """Signal the thread to stop"""
@@ -146,14 +146,14 @@ def start_execution_engine(engine_type: str = None):
                     if success:
                         _websocket_engine = get_websocket_execution_engine()
                         _current_engine_type = "websocket"
-                        logger.info("WebSocket execution engine started (with built-in fallback)")
+                        logger.debug("WebSocket execution engine started (with built-in fallback)")
                         return True, "WebSocket execution engine started"
                     else:
                         logger.warning(
                             f"Failed to start WebSocket engine: {message}, falling back to polling"
                         )
                 else:
-                    logger.warning(
+                    logger.debug(
                         "WebSocket proxy not healthy at startup, falling back to polling engine"
                     )
 
@@ -263,7 +263,7 @@ def _start_websocket_upgrade_watcher():
                     if success:
                         _websocket_engine = get_websocket_execution_engine()
                         _current_engine_type = "websocket"
-                        logger.info("WebSocket execution engine started (auto-upgrade)")
+                        logger.debug("WebSocket execution engine started (auto-upgrade)")
 
                         # Stop polling engine after successful upgrade
                         _execution_thread.stop()
@@ -271,7 +271,7 @@ def _start_websocket_upgrade_watcher():
                         if _execution_thread.is_alive():
                             logger.warning("Polling execution engine did not stop after upgrade")
                         else:
-                            logger.info("Polling execution engine stopped after upgrade")
+                            logger.debug("Polling execution engine stopped after upgrade")
                         _execution_thread = None
                         break
                     else:

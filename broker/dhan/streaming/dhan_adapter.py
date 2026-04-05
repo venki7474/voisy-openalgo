@@ -144,17 +144,16 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
     def connect(self) -> None:
         """Establish connections to Dhan WebSocket endpoints"""
-        if not self.ws_client_5depth or not self.ws_client_20depth:
+        if not self.ws_client_5depth:
             self.logger.error("WebSocket clients not initialized. Call initialize() first.")
             return
 
-        # Connect to 5-depth endpoint
+        # Connect only the 5-depth endpoint (always needed)
         self.logger.debug("Connecting to Dhan 5-depth WebSocket...")
         self.ws_client_5depth.connect()
 
-        # Connect to 20-depth endpoint
-        self.logger.debug("Connecting to Dhan 20-depth WebSocket...")
-        self.ws_client_20depth.connect()
+        # 20-depth WebSocket is connected lazily on first 20-depth subscription
+        # to avoid wasting Dhan's 5-connection-per-user limit
 
     def disconnect(self) -> None:
         """Disconnect from Dhan WebSocket endpoints with proper resource cleanup"""
@@ -337,6 +336,11 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self.depth_20_timeouts[correlation_id] = time.time() + 30
                 # Reset data received timestamp
                 self.depth_20_data_received[correlation_id] = time.time()
+
+            # Lazy-connect the 20-depth WebSocket on first demand
+            if self.ws_client_20depth and not self.ws_client_20depth.connected and not self.ws_client_20depth.running:
+                self.logger.info("Lazy-connecting Dhan 20-depth WebSocket (first 20-depth subscription)")
+                self.ws_client_20depth.connect()
 
             # Subscribe if connected
             if self.ws_client_20depth and self.ws_client_20depth.connected:
@@ -524,6 +528,7 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
     def _on_error_5depth(self, ws, error):
         """Handle 5-depth connection error"""
         self.logger.error(f"Dhan 5-depth WebSocket error: {error}")
+        self._check_and_publish_fatal_error(ws, error, "5-depth")
 
     def _on_close_5depth(self, ws):
         """Handle 5-depth connection close"""
@@ -575,15 +580,20 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
             market_data = self._normalize_5depth_data(data, symbol, exchange)
             if market_data:
                 # Determine topic based on data type
+                # Only publish modes the server understands (LTP, QUOTE, DEPTH)
+                # OI and prev_close are Dhan-specific packet types already
+                # included in full/quote data - skip them as standalone topics
                 mode_map = {
                     "ticker": "LTP",
                     "quote": "QUOTE",
                     "full": "DEPTH",
-                    "oi": "OI",
-                    "prev_close": "PREV_CLOSE",
                 }
 
-                mode_str = mode_map.get(data_type, "UNKNOWN")
+                mode_str = mode_map.get(data_type)
+                if not mode_str:
+                    # oi and prev_close packets don't map to server modes - skip
+                    return
+
                 topic = f"{exchange}_{symbol}_{mode_str}"
 
                 self.publish_market_data(topic, market_data)
@@ -612,6 +622,7 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
     def _on_error_20depth(self, ws, error):
         """Handle 20-depth connection error"""
         self.logger.error(f"Dhan 20-depth WebSocket error: {error}")
+        self._check_and_publish_fatal_error(ws, error, "20-depth")
 
     def _on_close_20depth(self, ws):
         """Handle 20-depth connection close"""
@@ -875,6 +886,24 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         except Exception as e:
             self.logger.error(f"Error performing fallback for {correlation_id}: {e}", exc_info=True)
+
+    def _check_and_publish_fatal_error(self, ws, error, connection_type: str):
+        """
+        Check if a WebSocket error is fatal (e.g., 429 Too Many Requests due to
+        expired data subscription) and log a clear message. Reconnection is already
+        stopped by the DhanWebSocket class when a fatal error is detected.
+        """
+        ws_client = None
+        if connection_type == "5-depth":
+            ws_client = self.ws_client_5depth
+        elif connection_type == "20-depth":
+            ws_client = self.ws_client_20depth
+
+        if ws_client and ws_client._fatal_error:
+            error_message = ws_client._fatal_error_message or str(error)
+            self.logger.error(
+                f"[DATA SUBSCRIPTION] Dhan {connection_type} WebSocket stopped: {error_message}"
+            )
 
     def cleanup(self) -> None:
         """

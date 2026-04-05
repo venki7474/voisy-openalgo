@@ -42,15 +42,15 @@ generate_hex() {
 # Function to validate broker
 validate_broker() {
     local broker=$1
-    local valid_brokers="fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,jainamxts,kotak,motilal,mstock,paytm,pocketful,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha"
-    [[ $valid_brokers == *"$broker"* ]]
+    local valid_brokers="fivepaisa,fivepaisaxts,aliceblue,angel,compositedge,definedge,deltaexchange,dhan,dhan_sandbox,firstock,flattrade,fyers,groww,ibulls,iifl,indmoney,jainamxts,kotak,motilal,mstock,nubra,paytm,pocketful,rmoney,samco,shoonya,tradejini,upstox,wisdom,zebu,zerodha"
+    [[ ",$valid_brokers," == *",$broker,"* ]]
 }
 
 # Function to check if broker is XTS based
 is_xts_broker() {
     local broker=$1
-    local xts_brokers="fivepaisaxts,compositedge,ibulls,iifl,jainamxts,wisdom"
-    [[ $xts_brokers == *"$broker"* ]]
+    local xts_brokers="fivepaisaxts,compositedge,ibulls,iifl,jainamxts,rmoney,wisdom"
+    [[ ",$xts_brokers," == *",$broker,"* ]]
 }
 
 # Start installation
@@ -113,10 +113,10 @@ done
 # Get broker name
 while true; do
     log "\nValid brokers:" "$BLUE"
-    echo "fivepaisa, fivepaisaxts, aliceblue, angel, compositedge, definedge,"
+    echo "fivepaisa, fivepaisaxts, aliceblue, angel, compositedge, definedge, deltaexchange,"
     echo "dhan, dhan_sandbox, firstock, flattrade, fyers, groww, ibulls, iifl,"
-    echo "indmoney, jainamxts, kotak, motilal, mstock, paytm, pocketful,"
-    echo "samco, shoonya, tradejini, upstox, wisdom, zebu, zerodha,"
+    echo "indmoney, jainamxts, kotak, motilal, mstock, nubra, paytm, pocketful,"
+    echo "rmoney, samco, shoonya, tradejini, upstox, wisdom, zebu, zerodha,"
     echo ""
     read -p "Enter your broker name: " BROKER_NAME
     if validate_broker "$BROKER_NAME"; then
@@ -283,24 +283,44 @@ if ! grep "CORS_ALLOWED_ORIGINS" .env | grep -q "https://$DOMAIN"; then
     fi
 fi
 
-# CSP: Add domain if not already present (preserves custom domains)
-if ! grep "CSP_CONNECT_SRC" .env | grep -q "https://$DOMAIN"; then
-    CURRENT_CSP=$(grep "CSP_CONNECT_SRC" .env | sed 's/.*= "\\(.*\\)"/\\1/')
-    if [ -n "$CURRENT_CSP" ] && ! echo "$CURRENT_CSP" | grep -q "https://$DOMAIN"; then
-        NEW_CSP="$CURRENT_CSP https://$DOMAIN wss://$DOMAIN"
-        $SUDO sed -i "s|CSP_CONNECT_SRC = \".*\"|CSP_CONNECT_SRC = \"$NEW_CSP\"|g" .env
-    fi
-fi
+# CSP: Set connect sources with domain (delete-and-append avoids sed regex issues with nested quotes)
+# See: https://github.com/marketcalls/openalgo/issues/938
+$SUDO sed -i '/^CSP_CONNECT_SRC/d' .env
+echo "CSP_CONNECT_SRC = \"'self' wss: ws: https://cdn.socket.io https://$DOMAIN wss://$DOMAIN\"" | $SUDO tee -a .env > /dev/null
 
 check_status "Environment configuration failed"
 
-# Calculate dynamic shm_size based on available RAM (25% of total, min 256m, max 2g)
+# Calculate dynamic resource limits based on system specs
 TOTAL_RAM_MB=$(($(grep MemTotal /proc/meminfo | awk '{print $2}') / 1024))
+CPU_CORES=$(nproc 2>/dev/null || echo 2)
+
+# shm_size: 25% of RAM (min 256MB, max 2GB)
 SHM_SIZE_MB=$((TOTAL_RAM_MB / 4))
-# Clamp between 256MB and 2048MB
 [ $SHM_SIZE_MB -lt 256 ] && SHM_SIZE_MB=256
 [ $SHM_SIZE_MB -gt 2048 ] && SHM_SIZE_MB=2048
-log "System RAM: ${TOTAL_RAM_MB}MB, SHM size: ${SHM_SIZE_MB}MB" "$BLUE"
+
+# Thread limits based on RAM (conservative for strategy subprocess compatibility)
+# 2GB: 1 thread | 4GB: 2 threads | 8GB+: min(4, cores)
+if [ $TOTAL_RAM_MB -lt 3000 ]; then
+    THREAD_LIMIT=1
+elif [ $TOTAL_RAM_MB -lt 6000 ]; then
+    THREAD_LIMIT=2
+else
+    THREAD_LIMIT=$((CPU_CORES < 4 ? CPU_CORES : 4))
+fi
+
+# Strategy memory limit based on RAM
+# 2GB: 256MB | 4GB: 512MB | 8GB+: 1024MB
+if [ $TOTAL_RAM_MB -lt 3000 ]; then
+    STRATEGY_MEM_LIMIT=256
+elif [ $TOTAL_RAM_MB -lt 6000 ]; then
+    STRATEGY_MEM_LIMIT=512
+else
+    STRATEGY_MEM_LIMIT=1024
+fi
+
+log "System: ${TOTAL_RAM_MB}MB RAM, ${CPU_CORES} cores" "$BLUE"
+log "Config: shm=${SHM_SIZE_MB}MB, threads=${THREAD_LIMIT}, strategy_mem=${STRATEGY_MEM_LIMIT}MB" "$BLUE"
 
 # Create docker-compose.yaml
 log "\n=== Creating Docker Compose Configuration ===" "$BLUE"
@@ -331,8 +351,17 @@ services:
       - FLASK_ENV=production
       - FLASK_DEBUG=0
       - APP_MODE=standalone
+      - TZ=Asia/Kolkata
+      # Resource limits auto-calculated based on system specs
+      # See: https://github.com/marketcalls/openalgo/issues/822
+      - OPENBLAS_NUM_THREADS=${THREAD_LIMIT}
+      - OMP_NUM_THREADS=${THREAD_LIMIT}
+      - MKL_NUM_THREADS=${THREAD_LIMIT}
+      - NUMEXPR_NUM_THREADS=${THREAD_LIMIT}
+      - NUMBA_NUM_THREADS=${THREAD_LIMIT}
+      - STRATEGY_MEMORY_LIMIT_MB=${STRATEGY_MEM_LIMIT}
 
-    # Shared memory for scipy/numba operations (dynamic: 25% of RAM, min 256m, max 2g)
+    # Shared memory for scipy/numba operations (auto-calculated: 25% of RAM)
     shm_size: '${SHM_SIZE_MB}m'
 
     healthcheck:

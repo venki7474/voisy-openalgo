@@ -1,10 +1,11 @@
 import { lazy, Suspense } from 'react'
-import { BrowserRouter, Route, Routes } from 'react-router-dom'
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { Providers } from '@/app/providers'
 import { AuthSync } from '@/components/auth/AuthSync'
 import { FullWidthLayout } from '@/components/layout/FullWidthLayout'
 import { Layout } from '@/components/layout/Layout'
 import { PageLoader } from '@/components/ui/page-loader'
+import { useBrokerStore } from '@/stores/brokerStore'
 
 // Lazy load all pages for code splitting
 // Public pages
@@ -21,6 +22,7 @@ const NotFound = lazy(() => import('@/pages/NotFound'))
 // Broker auth
 const BrokerSelect = lazy(() => import('@/pages/BrokerSelect'))
 const BrokerTOTP = lazy(() => import('@/pages/BrokerTOTP'))
+const SamcoAuth = lazy(() => import('@/pages/SamcoAuth'))
 
 // Main pages
 const Dashboard = lazy(() => import('@/pages/Dashboard'))
@@ -32,6 +34,7 @@ const Token = lazy(() => import('@/pages/Token'))
 const Search = lazy(() => import('@/pages/Search'))
 const ApiKey = lazy(() => import('@/pages/ApiKey'))
 const Profile = lazy(() => import('@/pages/Profile'))
+const MasterContract = lazy(() => import('@/pages/MasterContract'))
 const ActionCenter = lazy(() => import('@/pages/ActionCenter'))
 
 // Platform pages
@@ -49,8 +52,18 @@ const Playground = lazy(() => import('@/pages/Playground'))
 const Historify = lazy(() => import('@/pages/Historify'))
 const HistorifyCharts = lazy(() => import('@/pages/HistorifyCharts'))
 
-// Option Chain
+// Tools & Option Chain
+const Tools = lazy(() => import('@/pages/Tools'))
 const OptionChain = lazy(() => import('@/pages/OptionChain'))
+const IVChart = lazy(() => import('@/pages/IVChart'))
+const OITracker = lazy(() => import('@/pages/OITracker'))
+const MaxPain = lazy(() => import('@/pages/MaxPain'))
+const StraddleChart = lazy(() => import('@/pages/StraddleChart'))
+const CustomStraddle = lazy(() => import('@/pages/CustomStraddle'))
+const VolSurface = lazy(() => import('@/pages/VolSurface'))
+const GEXDashboard = lazy(() => import('@/pages/GEXDashboard'))
+const IVSmile = lazy(() => import('@/pages/IVSmile'))
+const OIProfile = lazy(() => import('@/pages/OIProfile'))
 
 // Strategy pages
 const StrategyIndex = lazy(() => import('@/pages/strategy/StrategyIndex'))
@@ -76,6 +89,27 @@ const ConfigureChartinkSymbols = lazy(() => import('@/pages/chartink/ConfigureCh
 const FlowIndex = lazy(() => import('@/pages/flow/FlowIndex'))
 const FlowEditor = lazy(() => import('@/pages/flow/FlowEditor'))
 const FlowKeyboardShortcuts = lazy(() => import('@/pages/flow/FlowKeyboardShortcuts'))
+
+// Leverage page (crypto brokers only)
+const Leverage = lazy(() => import('@/pages/Leverage'))
+
+/** Route guard: only renders children if leverage_config is true, else redirects to dashboard */
+function LeverageRoute() {
+  const capabilities = useBrokerStore((s) => s.capabilities)
+  if (!capabilities?.leverage_config) {
+    return <Navigate to="/dashboard" replace />
+  }
+  return <Leverage />
+}
+
+/** Route guard: hide Holdings for crypto brokers (no equity holdings concept) */
+function HoldingsRoute() {
+  const capabilities = useBrokerStore((s) => s.capabilities)
+  if (capabilities?.broker_type === 'crypto') {
+    return <Navigate to="/dashboard" replace />
+  }
+  return <Holdings />
+}
 
 // Admin pages
 const AdminIndex = lazy(() => import('@/pages/admin/AdminIndex'))
@@ -117,6 +151,7 @@ function App() {
               {/* Broker auth routes */}
               <Route path="/broker" element={<BrokerSelect />} />
               <Route path="/broker/:broker/totp" element={<BrokerTOTP />} />
+              <Route path="/broker/samco/auth" element={<SamcoAuth />} />
               {/* Dynamic broker TOTP routes for all supported brokers */}
               <Route path="/:broker/auth" element={<BrokerTOTP />} />
 
@@ -126,7 +161,7 @@ function App() {
                 <Route path="/positions" element={<Positions />} />
                 <Route path="/orderbook" element={<OrderBook />} />
                 <Route path="/tradebook" element={<TradeBook />} />
-                <Route path="/holdings" element={<Holdings />} />
+                <Route path="/holdings" element={<HoldingsRoute />} />
                 {/* Search routes - match Flask /search/* routes */}
                 <Route path="/search/token" element={<Token />} />
                 <Route path="/search" element={<Search />} />
@@ -141,7 +176,17 @@ function App() {
                 <Route path="/sandbox" element={<Sandbox />} />
                 <Route path="/sandbox/mypnl" element={<SandboxPnL />} />
                 <Route path="/analyzer" element={<Analyzer />} />
+                <Route path="/tools" element={<Tools />} />
                 <Route path="/optionchain" element={<OptionChain />} />
+                <Route path="/ivchart" element={<IVChart />} />
+                <Route path="/oitracker" element={<OITracker />} />
+                <Route path="/maxpain" element={<MaxPain />} />
+                <Route path="/straddle" element={<StraddleChart />} />
+                <Route path="/straddlepnl" element={<CustomStraddle />} />
+                <Route path="/volsurface" element={<VolSurface />} />
+                <Route path="/gex" element={<GEXDashboard />} />
+                <Route path="/ivsmile" element={<IVSmile />} />
+                <Route path="/oiprofile" element={<OIProfile />} />
                 <Route path="/websocket/test" element={<WebSocketTest />} />
                 <Route path="/websocket/test/20" element={<WebSocketTest depthLevel={20} />} />
                 <Route path="/websocket/test/30" element={<WebSocketTest depthLevel={30} />} />
@@ -169,6 +214,8 @@ function App() {
                 {/* Flow Editor */}
                 <Route path="/flow" element={<FlowIndex />} />
                 <Route path="/flow/shortcuts" element={<FlowKeyboardShortcuts />} />
+                {/* Leverage Configuration (crypto brokers only) */}
+                <Route path="/leverage" element={<LeverageRoute />} />
                 {/* Phase 7: Admin */}
                 <Route path="/admin" element={<AdminIndex />} />
                 <Route path="/admin/freeze" element={<FreezeQty />} />
@@ -189,6 +236,7 @@ function App() {
                 <Route path="/health" element={<HealthMonitor />} />
                 {/* Phase 7: Settings & Action Center */}
                 <Route path="/profile" element={<Profile />} />
+                <Route path="/master-contract" element={<MasterContract />} />
                 <Route path="/action-center" element={<ActionCenter />} />
               </Route>
 

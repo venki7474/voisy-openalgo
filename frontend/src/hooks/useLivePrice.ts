@@ -17,6 +17,7 @@ export interface PriceableItem {
   quantity?: number
   average_price?: number
   today_realized_pnl?: number  // Sandbox: today's realized P&L from closed partial trades
+  lot_size?: number             // Contract multiplier (e.g. 0.01 for Delta Exchange ETHUSD.P)
 }
 
 /**
@@ -49,6 +50,8 @@ export interface UseLivePriceResult<T extends PriceableItem> {
   isConnected: boolean
   /** Whether WebSocket is paused due to tab being hidden */
   isPaused: boolean
+  /** Whether using REST API fallback instead of WebSocket */
+  isFallbackMode: boolean
   /** Whether any market is currently open */
   isAnyMarketOpen: boolean
   /** Map of MultiQuotes data for external access if needed */
@@ -83,7 +86,6 @@ export function useLivePrice<T extends PriceableItem>(
     useMultiQuotesFallback = true,
     multiQuotesRefreshInterval = 30000,
     pauseWhenHidden = true,
-    pauseDelay = 5000,
   } = options
 
   const { apiKey } = useAuthStore()
@@ -108,12 +110,10 @@ export function useLivePrice<T extends PriceableItem>(
   )
 
   // WebSocket market data - connect when enabled, with visibility awareness
-  const { data: marketData, isConnected: wsConnected, isPaused: wsPaused } = useMarketData({
+  const { data: marketData, isConnected: wsConnected, isPaused: wsPaused, isFallbackMode } = useMarketData({
     symbols,
     mode: 'LTP',
     enabled: enabled && items.length > 0,
-    pauseWhenHidden,
-    pauseDelay,
   })
 
   // Effective live status
@@ -145,7 +145,6 @@ export function useLivePrice<T extends PriceableItem>(
       }
     } catch {
       // Silently fail - MultiQuotes is a fallback mechanism
-      console.debug('MultiQuotes fetch failed, using cached/REST data')
     }
   }, [apiKey, items, useMultiQuotesFallback])
 
@@ -246,14 +245,18 @@ export function useLivePrice<T extends PriceableItem>(
       const todayRealizedPnl = item.today_realized_pnl || 0
 
       if (currentLtp && avgPrice > 0) {
+        // Contract multiplier: e.g. 0.01 for Delta Exchange ETHUSD.P (1 lot = 0.01 ETH)
+        // Defaults to 1 for all standard brokers where qty is already in underlying units
+        const lotSize = item.lot_size ?? 1
+
         // Calculate unrealized P&L based on position direction
         // Long (qty > 0): profit when ltp > avgPrice
         // Short (qty < 0): profit when ltp < avgPrice
         let unrealizedPnl: number
         if (qty > 0) {
-          unrealizedPnl = (currentLtp - avgPrice) * qty
+          unrealizedPnl = (currentLtp - avgPrice) * qty * lotSize
         } else {
-          unrealizedPnl = (avgPrice - currentLtp) * Math.abs(qty)
+          unrealizedPnl = (avgPrice - currentLtp) * Math.abs(qty) * lotSize
         }
 
         // Total P&L = today's realized (from partial closes) + current unrealized
@@ -279,6 +282,7 @@ export function useLivePrice<T extends PriceableItem>(
     isLive,
     isConnected: wsConnected,
     isPaused: wsPaused,
+    isFallbackMode,
     isAnyMarketOpen: anyMarketOpen,
     multiQuotes,
     refreshMultiQuotes: fetchMultiQuotes,

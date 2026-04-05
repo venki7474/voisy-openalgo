@@ -87,6 +87,7 @@ import { profileMenuItems } from '@/config/navigation'
 import { authApi } from '@/api/auth'
 import { useAuthStore } from '@/stores/authStore'
 import { useThemeStore } from '@/stores/themeStore'
+import { LogoutConfirmDialog } from '@/components/auth/LogoutConfirmDialog'
 
 // Types
 interface SearchResult {
@@ -249,6 +250,7 @@ export default function Historify() {
   const { appMode, toggleAppMode, mode, toggleMode, isTogglingMode } = useThemeStore()
   const { user, logout } = useAuthStore()
   const navigate = useNavigate()
+  const [showLogoutDialog, setShowLogoutDialog] = useState(false)
 
   // Core state
   const [watchlist, setWatchlist] = useState<WatchlistItem[]>([])
@@ -259,7 +261,7 @@ export default function Historify() {
     computed_intervals: string[]
     all_intervals: string[]
   } | null>(null)
-  const [exchanges, setExchanges] = useState<string[]>(['NSE', 'BSE', 'NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NSE_INDEX', 'BSE_INDEX'])
+  const [exchanges, setExchanges] = useState<string[]>(['NSE', 'BSE', 'NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NSE_INDEX', 'BSE_INDEX', 'CRYPTO'])
   const [stats, setStats] = useState<Stats>({ database_size_mb: 0, total_records: 0, total_symbols: 0, watchlist_count: 0 })
 
   // Tab state
@@ -571,7 +573,6 @@ export default function Historify() {
       const data = await response.json()
       if (data.status === 'success') setWatchlist(data.data || [])
     } catch (error) {
-      console.error('Error loading watchlist:', error)
     }
   }
 
@@ -581,7 +582,6 @@ export default function Historify() {
       const data = await response.json()
       if (data.status === 'success') setCatalog(data.data || [])
     } catch (error) {
-      console.error('Error loading catalog:', error)
     }
   }
 
@@ -591,7 +591,6 @@ export default function Historify() {
       const data = await response.json()
       if (data.status === 'success') setIntervals(data.data)
     } catch (error) {
-      console.error('Error loading intervals:', error)
     }
   }
 
@@ -607,7 +606,6 @@ export default function Historify() {
         })
       }
     } catch (error) {
-      console.error('Error loading historify intervals:', error)
     }
   }
 
@@ -617,7 +615,6 @@ export default function Historify() {
       const data = await response.json()
       if (data.status === 'success') setStats(data.data)
     } catch (error) {
-      console.error('Error loading stats:', error)
     }
   }
 
@@ -627,7 +624,6 @@ export default function Historify() {
       const data = await response.json()
       if (data.status === 'success' && data.data?.length > 0) setExchanges(data.data)
     } catch (error) {
-      console.error('Error loading exchanges:', error)
     }
   }
 
@@ -638,7 +634,6 @@ export default function Historify() {
       const data = await response.json()
       if (data.status === 'success') setJobs(data.data || [])
     } catch (error) {
-      console.error('Error loading jobs:', error)
     } finally {
       setJobsLoading(false)
     }
@@ -652,7 +647,6 @@ export default function Historify() {
       const data = await response.json()
       if (data.status === 'success') setSchedules(data.data || [])
     } catch (error) {
-      console.error('Error loading schedules:', error)
     } finally {
       setSchedulesLoading(false)
     }
@@ -666,7 +660,6 @@ export default function Historify() {
         setScheduleExecutions((prev) => ({ ...prev, [scheduleId]: data.data || [] }))
       }
     } catch (error) {
-      console.error('Error loading schedule executions:', error)
     }
   }
 
@@ -745,7 +738,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to save schedule', 'historify')
       }
     } catch (error) {
-      console.error('Error saving schedule:', error)
       showToast.error('Failed to save schedule', 'historify')
     } finally {
       setIsCreatingSchedule(false)
@@ -768,7 +760,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to delete schedule', 'historify')
       }
     } catch (error) {
-      console.error('Error deleting schedule:', error)
       showToast.error('Failed to delete schedule', 'historify')
     }
   }
@@ -790,7 +781,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to toggle schedule', 'historify')
       }
     } catch (error) {
-      console.error('Error toggling schedule:', error)
       showToast.error('Failed to toggle schedule', 'historify')
     }
   }
@@ -812,7 +802,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to pause/resume schedule', 'historify')
       }
     } catch (error) {
-      console.error('Error pausing/resuming schedule:', error)
       showToast.error('Failed to pause/resume schedule', 'historify')
     }
   }
@@ -834,7 +823,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to trigger schedule', 'historify')
       }
     } catch (error) {
-      console.error('Error triggering schedule:', error)
       showToast.error('Failed to trigger schedule', 'historify')
     }
   }
@@ -873,7 +861,6 @@ export default function Historify() {
       setSearchResults((data.results || []).slice(0, 10))
       setShowSearchResults(true)
     } catch (error) {
-      console.error('Error searching symbols:', error)
       setSearchResults([])
     }
   }
@@ -902,7 +889,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to add symbol', 'historify')
       }
     } catch (error) {
-      console.error('Error adding to watchlist:', error)
       showToast.error('Failed to add symbol', 'historify')
     }
   }
@@ -925,7 +911,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to remove symbol', 'historify')
       }
     } catch (error) {
-      console.error('Error removing from watchlist:', error)
       showToast.error('Failed to remove symbol', 'historify')
     }
   }
@@ -964,7 +949,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to bulk add symbols', 'historify')
       }
     } catch (error) {
-      console.error('Error bulk adding:', error)
       showToast.error('Failed to bulk add symbols', 'historify')
     } finally {
       setIsBulkAdding(false)
@@ -1062,7 +1046,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to create job', 'historify')
       }
     } catch (error) {
-      console.error('Error creating job:', error)
       showToast.error('Failed to create job', 'historify')
     }
   }
@@ -1092,7 +1075,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to pause job', 'historify')
       }
     } catch (error) {
-      console.error('Error pausing job:', error)
       showToast.error('Failed to pause job', 'historify')
     }
   }
@@ -1113,7 +1095,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to resume job', 'historify')
       }
     } catch (error) {
-      console.error('Error resuming job:', error)
       showToast.error('Failed to resume job', 'historify')
     }
   }
@@ -1134,7 +1115,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to cancel job', 'historify')
       }
     } catch (error) {
-      console.error('Error cancelling job:', error)
       showToast.error('Failed to cancel job', 'historify')
     }
   }
@@ -1155,7 +1135,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to retry job', 'historify')
       }
     } catch (error) {
-      console.error('Error retrying job:', error)
       showToast.error('Failed to retry job', 'historify')
     }
   }
@@ -1179,7 +1158,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to delete job', 'historify')
       }
     } catch (error) {
-      console.error('Error deleting job:', error)
       showToast.error('Failed to delete job', 'historify')
     }
   }
@@ -1204,7 +1182,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to delete data', 'historify')
       }
     } catch (error) {
-      console.error('Error deleting data:', error)
       showToast.error('Failed to delete data', 'historify')
     } finally {
       setDeleteDialogOpen(false)
@@ -1238,7 +1215,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to delete data', 'historify')
       }
     } catch (error) {
-      console.error('Error bulk deleting data:', error)
       showToast.error('Failed to delete data', 'historify')
     } finally {
       setIsBulkDeleting(false)
@@ -1271,7 +1247,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to remove from watchlist', 'historify')
       }
     } catch (error) {
-      console.error('Error bulk removing from watchlist:', error)
       showToast.error('Failed to remove from watchlist', 'historify')
     } finally {
       setIsBulkWatchlistDeleting(false)
@@ -1329,7 +1304,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to upload data', 'historify')
       }
     } catch (error) {
-      console.error('Error uploading CSV:', error)
       showToast.error('Failed to upload CSV', 'historify')
     } finally {
       setIsUploading(false)
@@ -1371,7 +1345,6 @@ export default function Historify() {
         showToast.error(data.message || 'Failed to export data', 'historify')
       }
     } catch (error) {
-      console.error('Error exporting data:', error)
       showToast.error('Failed to export data', 'historify')
     } finally {
       setIsExporting(false)
@@ -1579,7 +1552,7 @@ export default function Historify() {
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
-                  onClick={handleLogout}
+                  onClick={() => setShowLogoutDialog(true)}
                   className="text-destructive focus:text-destructive"
                 >
                   <LogOut className="h-4 w-4 mr-2" />
@@ -1590,6 +1563,12 @@ export default function Historify() {
           </div>
         </div>
       </div>
+
+      <LogoutConfirmDialog
+        open={showLogoutDialog}
+        onOpenChange={setShowLogoutDialog}
+        onConfirm={handleLogout}
+      />
 
       {/* Main Content */}
       <div className="flex-1 overflow-hidden">

@@ -159,10 +159,12 @@ interface PermissionsData {
 
 // Toast position options
 const TOAST_POSITIONS: { value: ToastPosition; label: string }[] = [
-  { value: 'top-right', label: 'Top Right' },
   { value: 'top-left', label: 'Top Left' },
-  { value: 'bottom-right', label: 'Bottom Right' },
+  { value: 'top-center', label: 'Top Center' },
+  { value: 'top-right', label: 'Top Right' },
   { value: 'bottom-left', label: 'Bottom Left' },
+  { value: 'bottom-center', label: 'Bottom Center' },
+  { value: 'bottom-right', label: 'Bottom Right' },
 ]
 
 // Alert category descriptions - organized by groups
@@ -352,7 +354,6 @@ export default function ProfilePage() {
         }
       }
     } catch (error) {
-      console.error('Error fetching profile data:', error)
       showToast.error('Failed to load profile data', 'admin')
     } finally {
       setIsLoading(false)
@@ -372,7 +373,6 @@ export default function ProfilePage() {
         setWebsocketUrl(response.data.data.websocket_url || '')
       }
     } catch (error) {
-      console.error('Error fetching broker credentials:', error)
     }
   }
 
@@ -386,7 +386,6 @@ export default function ProfilePage() {
         setPermissionsData(response.data.data)
       }
     } catch (error) {
-      console.error('Error fetching permissions:', error)
       showToast.error('Failed to load permission status', 'admin')
     } finally {
       setIsLoadingPermissions(false)
@@ -418,7 +417,6 @@ export default function ProfilePage() {
         showToast.error('Failed to fix permissions', 'admin')
       }
     } catch (error) {
-      console.error('Error fixing permissions:', error)
       showToast.error('Failed to fix permissions', 'admin')
     } finally {
       setIsFixingPermissions(false)
