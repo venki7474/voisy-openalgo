@@ -7,6 +7,7 @@ Supports split orders per leg if splitsize is specified.
 """
 
 import copy
+import math
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,7 +15,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
 from events import AnalyzerErrorEvent, MultiOrderCompletedEvent
-from services.option_symbol_service import get_option_symbol, parse_underlying_symbol
+from services.option_symbol_service import (
+    construct_option_symbol,
+    find_option_in_database,
+    get_option_exchange,
+    get_option_symbol,
+    parse_underlying_symbol,
+)
 from services.place_order_service import place_order
 from services.quotes_service import get_quotes
 from utils.event_bus import bus
@@ -137,6 +144,7 @@ def place_single_split_order_for_leg(
     total_orders: int,
     auth_token: str | None = None,
     broker: str | None = None,
+    prefetched_quote: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Place a single split order for a leg and return result.
@@ -148,6 +156,7 @@ def place_single_split_order_for_leg(
         total_orders: Total number of split orders
         auth_token: Direct broker auth token (optional)
         broker: Broker name (optional)
+        prefetched_quote: Pre-fetched quote for sandbox batch optimization (optional)
 
     Returns:
         Result dictionary with order status
@@ -161,6 +170,7 @@ def place_single_split_order_for_leg(
             auth_token=auth_token,
             broker=broker,
             emit_event=False,
+            prefetched_quote=prefetched_quote,
         )
 
         if success:
@@ -187,6 +197,138 @@ def place_single_split_order_for_leg(
         }
 
 
+def resolve_leg_symbol_by_strike(
+    underlying: str,
+    exchange: str,
+    expiry_date: str,
+    strike: Any,
+    option_type: Any,
+    underlying_ltp: float | None = None,
+) -> tuple[bool, dict[str, Any], int]:
+    """Resolve a leg that names its own strike instead of an offset.
+
+    The offset path prices the strike off the underlying LTP at run time, which
+    is what a repeating workflow wants. A leg that names an absolute strike is
+    asking for one specific contract instead, so the strike is taken as given
+    and only has to exist in the master contract.
+
+    Returns the same ``(success, response, status_code)`` shape as
+    ``get_option_symbol()`` and carries the same three keys the caller reads:
+    ``symbol``, ``exchange`` and ``underlying_ltp``.
+    """
+    # bool is an int subclass, so True would otherwise pass as a strike of 1.
+    if (
+        isinstance(strike, bool)
+        or not isinstance(strike, (int, float))
+        or not math.isfinite(strike)
+        or strike <= 0
+    ):
+        return (
+            False,
+            {
+                "status": "error",
+                "message": f"Invalid strike: {strike!r}. Strike must be a positive number.",
+            },
+            400,
+        )
+
+    normalized_type = option_type.strip().upper() if isinstance(option_type, str) else option_type
+    if normalized_type not in ("CE", "PE"):
+        return (
+            False,
+            {
+                "status": "error",
+                "message": (
+                    f"Invalid option_type: {option_type!r}. Supported option types are CE and PE."
+                ),
+            },
+            400,
+        )
+
+    base_symbol, embedded_expiry = parse_underlying_symbol(underlying)
+    resolved_expiry = embedded_expiry or expiry_date
+    if not resolved_expiry:
+        return (
+            False,
+            {"status": "error", "message": "No expiry date available to resolve the leg symbol."},
+            400,
+        )
+
+    options_exchange = get_option_exchange(exchange or "")
+    option_symbol = construct_option_symbol(
+        base_symbol, resolved_expiry, strike, normalized_type
+    )
+
+    # A named strike is only usable if the exchange actually lists it. Saying
+    # which strike failed beats a broker-side "invalid symbol" further down.
+    option_info = find_option_in_database(option_symbol, options_exchange)
+    if not option_info:
+        return (
+            False,
+            {
+                "status": "error",
+                "message": (
+                    f"Option symbol {option_symbol} not found in {options_exchange}. "
+                    f"Check that strike {strike} is listed for {base_symbol} "
+                    f"{resolved_expiry}, or re-download the master contract."
+                ),
+            },
+            404,
+        )
+
+    return (
+        True,
+        {
+            "status": "success",
+            "symbol": option_info.get("symbol", option_symbol),
+            "exchange": option_info.get("exchange", options_exchange),
+            "strike": strike,
+            "expiry_date": resolved_expiry,
+            "option_type": normalized_type,
+            "underlying_ltp": underlying_ltp,
+        },
+        200,
+    )
+
+
+def resolve_leg_symbol(
+    leg_data: dict[str, Any],
+    common_data: dict[str, Any],
+    api_key: str,
+    underlying_ltp: float | None = None,
+) -> tuple[bool, dict[str, Any], int]:
+    """Resolve one leg to a tradable option symbol.
+
+    A leg either names an absolute strike or an offset resolved against the
+    live underlying. The strike wins when both are present, since it is the
+    more specific of the two. Both branches return the same shape, so callers
+    read ``symbol``/``exchange``/``underlying_ltp`` either way.
+    """
+    leg_expiry = leg_data.get("expiry_date") or common_data.get("expiry_date")
+    leg_strike = leg_data.get("strike")
+
+    if leg_strike is not None:
+        return resolve_leg_symbol_by_strike(
+            underlying=common_data.get("underlying"),
+            exchange=common_data.get("exchange"),
+            expiry_date=leg_expiry,
+            strike=leg_strike,
+            option_type=leg_data.get("option_type"),
+            underlying_ltp=underlying_ltp,
+        )
+
+    return get_option_symbol(
+        underlying=common_data.get("underlying"),
+        exchange=common_data.get("exchange"),
+        expiry_date=leg_expiry,
+        strike_int=common_data.get("strike_int"),
+        offset=leg_data.get("offset"),
+        option_type=leg_data.get("option_type"),
+        api_key=api_key,
+        underlying_ltp=underlying_ltp,
+    )
+
+
 def resolve_and_place_leg(
     leg_data: dict[str, Any],
     common_data: dict[str, Any],
@@ -196,6 +338,7 @@ def resolve_and_place_leg(
     auth_token: str | None = None,
     broker: str | None = None,
     underlying_ltp: float | None = None,
+    leg_quote_cache: dict[tuple[str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Resolve option symbol and place order for a single leg.
@@ -210,6 +353,7 @@ def resolve_and_place_leg(
         auth_token: Direct broker auth token (optional)
         broker: Broker name (optional)
         underlying_ltp: Pre-fetched underlying LTP to avoid redundant quote requests
+        leg_quote_cache: Pre-fetched quotes keyed by (symbol, exchange) for sandbox batch optimization
 
     Returns:
         Result dictionary with leg details and order status
@@ -217,23 +361,15 @@ def resolve_and_place_leg(
     try:
         # Step 1: Resolve option symbol
         # Use leg-specific expiry_date if provided, otherwise fall back to common expiry_date
-        leg_expiry = leg_data.get("expiry_date") or common_data.get("expiry_date")
-
-        success, symbol_response, status_code = get_option_symbol(
-            underlying=common_data.get("underlying"),
-            exchange=common_data.get("exchange"),
-            expiry_date=leg_expiry,
-            strike_int=common_data.get("strike_int"),
-            offset=leg_data.get("offset"),
-            option_type=leg_data.get("option_type"),
-            api_key=api_key,
-            underlying_ltp=underlying_ltp,
+        success, symbol_response, status_code = resolve_leg_symbol(
+            leg_data, common_data, api_key, underlying_ltp
         )
 
         if not success:
             return {
                 "leg": leg_index + 1,
                 "offset": leg_data.get("offset"),
+                "strike": leg_data.get("strike"),
                 "option_type": leg_data.get("option_type", "").upper(),
                 "action": leg_data.get("action", "").upper(),
                 "status": "error",
@@ -261,6 +397,7 @@ def resolve_and_place_leg(
                     "symbol": resolved_symbol,
                     "exchange": resolved_exchange,
                     "offset": leg_data.get("offset"),
+                    "strike": leg_data.get("strike"),
                     "option_type": leg_data.get("option_type", "").upper(),
                     "action": leg_data.get("action", "").upper(),
                     "status": "error",
@@ -280,7 +417,7 @@ def resolve_and_place_leg(
                 "symbol": resolved_symbol,
                 "action": leg_data.get("action"),
                 "pricetype": leg_data.get("pricetype", "MARKET"),
-                "product": leg_data.get("product", "MIS"),
+                "product": leg_data.get("product", "NRML"),
                 "price": leg_data.get("price", 0.0),
                 "trigger_price": leg_data.get("trigger_price", 0.0),
                 "disclosed_quantity": leg_data.get("disclosed_quantity", 0),
@@ -291,6 +428,9 @@ def resolve_and_place_leg(
             split_results = []
             order_delay = get_order_rate_limit()
 
+            # Look up pre-fetched quote for this resolved option symbol
+            prefetched = (leg_quote_cache or {}).get((resolved_symbol, resolved_exchange))
+
             # Place full-size orders
             for i in range(num_full_orders):
                 if i > 0:
@@ -298,7 +438,8 @@ def resolve_and_place_leg(
                 order_data = copy.deepcopy(base_order_data)
                 order_data["quantity"] = splitsize
                 result = place_single_split_order_for_leg(
-                    order_data, api_key, i + 1, total_split_orders, auth_token, broker
+                    order_data, api_key, i + 1, total_split_orders, auth_token, broker,
+                    prefetched_quote=prefetched,
                 )
                 split_results.append(result)
 
@@ -309,7 +450,8 @@ def resolve_and_place_leg(
                 order_data = copy.deepcopy(base_order_data)
                 order_data["quantity"] = remaining_qty
                 result = place_single_split_order_for_leg(
-                    order_data, api_key, total_split_orders, total_split_orders, auth_token, broker
+                    order_data, api_key, total_split_orders, total_split_orders, auth_token, broker,
+                    prefetched_quote=prefetched,
                 )
                 split_results.append(result)
 
@@ -321,7 +463,12 @@ def resolve_and_place_leg(
                 "leg": leg_index + 1,
                 "symbol": resolved_symbol,
                 "exchange": resolved_exchange,
+                # The split path reports one aggregated leg. Without product,
+                # subscribers keying on (symbol, exchange, product) cannot match
+                # it, unlike the non-split path below.
+                "product": leg_data.get("product", "NRML"),
                 "offset": leg_data.get("offset"),
+                "strike": leg_data.get("strike"),
                 "option_type": leg_data.get("option_type", "").upper(),
                 "action": leg_data.get("action", "").upper(),
                 "status": overall_status,
@@ -340,7 +487,7 @@ def resolve_and_place_leg(
             "action": leg_data.get("action"),
             "quantity": leg_data.get("quantity"),
             "pricetype": leg_data.get("pricetype", "MARKET"),
-            "product": leg_data.get("product", "MIS"),
+            "product": leg_data.get("product", "NRML"),
             "price": leg_data.get("price", 0.0),
             "trigger_price": leg_data.get("trigger_price", 0.0),
             "disclosed_quantity": leg_data.get("disclosed_quantity", 0),
@@ -350,12 +497,15 @@ def resolve_and_place_leg(
         # Step 3: Place the order
         # Pass emit_event=False to suppress per-leg socket events
         # A summary event is emitted at the end of all legs
+        # Look up pre-fetched quote for this resolved option symbol
+        prefetched = (leg_quote_cache or {}).get((resolved_symbol, resolved_exchange))
         success, order_response, status_code = place_order(
             order_data=order_data,
             api_key=api_key,
             auth_token=auth_token,
             broker=broker,
             emit_event=False,
+            prefetched_quote=prefetched,
         )
 
         if success:
@@ -363,7 +513,11 @@ def resolve_and_place_leg(
                 "leg": leg_index + 1,
                 "symbol": resolved_symbol,
                 "exchange": resolved_exchange,
+                # Each leg can carry its own product, so the summary event's
+                # value is not authoritative for subscribers keying on the leg.
+                "product": order_data.get("product", ""),
                 "offset": leg_data.get("offset"),
+                "strike": leg_data.get("strike"),
                 "option_type": leg_data.get("option_type", "").upper(),
                 "action": leg_data.get("action", "").upper(),
                 "status": "success",
@@ -381,6 +535,7 @@ def resolve_and_place_leg(
                 "symbol": resolved_symbol,
                 "exchange": resolved_exchange,
                 "offset": leg_data.get("offset"),
+                "strike": leg_data.get("strike"),
                 "option_type": leg_data.get("option_type", "").upper(),
                 "action": leg_data.get("action", "").upper(),
                 "status": "error",
@@ -444,13 +599,51 @@ def process_multiorder_with_auth(
     has_split_orders = any(leg.get("splitsize", 0) > 0 for _, leg in buy_legs + sell_legs)
     order_delay = get_order_rate_limit() if has_split_orders else 0
 
+    # Pre-fetch quotes for all legs in sandbox mode via single multiquotes call.
+    # Each leg has a different option symbol — without this, each leg would make
+    # its own REST API quote call (~300-500ms each).
+    leg_quote_cache = {}
+    if get_analyze_mode():
+        try:
+            # Resolve all option symbols first (DB lookups, fast)
+            resolved_symbols = []
+            for _, leg in buy_legs + sell_legs:
+                success_sym, sym_response, _ = resolve_leg_symbol(
+                    leg, common_data, api_key, underlying_ltp
+                )
+                if success_sym:
+                    sym = sym_response.get("symbol")
+                    exch = sym_response.get("exchange")
+                    if sym and exch:
+                        resolved_symbols.append({"symbol": sym, "exchange": exch})
+
+            # Batch-fetch all option quotes in one multiquotes call
+            if resolved_symbols:
+                from services.quotes_service import get_multiquotes
+                success_mq, mq_response, _ = get_multiquotes(
+                    symbols=resolved_symbols, api_key=api_key
+                )
+                if success_mq and "results" in mq_response:
+                    for result in mq_response["results"]:
+                        sym = result.get("symbol")
+                        exch = result.get("exchange")
+                        data = result.get("data")
+                        if sym and exch and data:
+                            leg_quote_cache[(sym, exch)] = data
+                    logger.info(
+                        f"Pre-fetched {len(leg_quote_cache)} option quotes for multiorder"
+                    )
+        except Exception as e:
+            logger.debug(f"Multiquotes pre-fetch failed for multiorder, falling back to per-leg fetch: {e}")
+
     # Process all legs sequentially (avoids ThreadPoolExecutor + eventlet hang)
     # Process BUY legs first
     for i, (orig_idx, leg) in enumerate(buy_legs):
         if order_delay and i > 0:
             time.sleep(order_delay)
         result = resolve_and_place_leg(
-            leg, common_data, api_key, orig_idx, total_legs, auth_token, broker, underlying_ltp
+            leg, common_data, api_key, orig_idx, total_legs, auth_token, broker, underlying_ltp,
+            leg_quote_cache=leg_quote_cache,
         )
         if result:
             results.append(result)
@@ -460,7 +653,8 @@ def process_multiorder_with_auth(
         if order_delay and (i > 0 or buy_legs):
             time.sleep(order_delay)
         result = resolve_and_place_leg(
-            leg, common_data, api_key, orig_idx, total_legs, auth_token, broker, underlying_ltp
+            leg, common_data, api_key, orig_idx, total_legs, auth_token, broker, underlying_ltp,
+            leg_quote_cache=leg_quote_cache,
         )
         if result:
             results.append(result)

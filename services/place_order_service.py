@@ -1,6 +1,5 @@
 import copy
 import importlib
-import traceback
 from typing import Any, Dict, Optional, Tuple
 
 from database.auth_db import get_auth_token_broker
@@ -52,13 +51,15 @@ def emit_analyzer_error(request_data: dict[str, Any], error_message: str) -> dic
         del analyzer_request["apikey"]
     analyzer_request["api_type"] = "placeorder"
 
-    bus.publish(AnalyzerErrorEvent(
-        mode="analyze",
-        api_type="placeorder",
-        request_data=analyzer_request,
-        response_data=error_response,
-        error_message=error_message,
-    ))
+    bus.publish(
+        AnalyzerErrorEvent(
+            mode="analyze",
+            api_type="placeorder",
+            request_data=analyzer_request,
+            response_data=error_response,
+            error_message=error_message,
+        )
+    )
 
     return error_response
 
@@ -121,6 +122,8 @@ def place_order_with_auth(
     broker: str,
     original_data: dict[str, Any],
     emit_event: bool = True,
+    prefetched_quote: dict[str, Any] | None = None,
+    force_live: bool = False,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Place an order using provided auth token.
@@ -131,6 +134,7 @@ def place_order_with_auth(
         broker: Name of the broker
         original_data: Original request data for logging
         emit_event: Whether to emit socket event (default True, set False for batch orders)
+        prefetched_quote: Pre-fetched quote from batch call (optional, sandbox only)
 
     Returns:
         Tuple containing:
@@ -144,8 +148,21 @@ def place_order_with_auth(
 
     api_key = original_data.get("apikey", "")
 
-    # If in analyze mode, route to sandbox for virtual trading
-    if get_analyze_mode():
+    # If in analyze mode, route to sandbox for sandbox trading.
+    #
+    # force_live opts out, for a caller that already decided the pipe. The
+    # strategy module picks live or sandbox per RUN, not per platform: two runs
+    # may disagree, and the run's own mode is authoritative. Without this, an
+    # operator turning the analyzer on to try something elsewhere would divert
+    # a live run's exits into the sandbox, where they report success, so the
+    # engine closes the leg and finalises while the real broker position is
+    # left open with nothing managing it.
+    #
+    # The read services already have this escape, spelled `and original_data`
+    # (see orderbook_service). This is the same idea made explicit, because a
+    # write path should not infer intent from whether a logging argument
+    # happens to be None.
+    if get_analyze_mode() and not force_live:
         from services.sandbox_service import sandbox_place_order
 
         if not api_key:
@@ -156,24 +173,28 @@ def place_order_with_auth(
             }
             return False, error_response, 400
 
-        success, response, status_code = sandbox_place_order(order_data, api_key, original_data)
+        success, response, status_code = sandbox_place_order(
+            order_data, api_key, original_data, prefetched_quote=prefetched_quote
+        )
 
         if emit_event:
-            bus.publish(OrderPlacedEvent(
-                mode="analyze",
-                api_type="placeorder",
-                strategy=order_data.get("strategy", ""),
-                symbol=order_data.get("symbol", ""),
-                exchange=order_data.get("exchange", ""),
-                action=order_data.get("action", ""),
-                quantity=int(order_data.get("quantity", 0)),
-                pricetype=order_data.get("pricetype", ""),
-                product=order_data.get("product", ""),
-                orderid=response.get("orderid", ""),
-                request_data=order_request_data,
-                response_data=response,
-                api_key=api_key,
-            ))
+            bus.publish(
+                OrderPlacedEvent(
+                    mode="analyze",
+                    api_type="placeorder",
+                    strategy=order_data.get("strategy", ""),
+                    symbol=order_data.get("symbol", ""),
+                    exchange=order_data.get("exchange", ""),
+                    action=order_data.get("action", ""),
+                    quantity=int(order_data.get("quantity", 0)),
+                    pricetype=order_data.get("pricetype", ""),
+                    product=order_data.get("product", ""),
+                    orderid=response.get("orderid", ""),
+                    request_data=order_request_data,
+                    response_data=response,
+                    api_key=api_key,
+                )
+            )
 
         return success, response, status_code
 
@@ -181,58 +202,63 @@ def place_order_with_auth(
     broker_module = import_broker_module(broker)
     if broker_module is None:
         error_response = {"status": "error", "message": "Broker-specific module not found"}
-        bus.publish(OrderFailedEvent(
-            mode="live",
-            api_type="placeorder",
-            request_data=order_request_data,
-            response_data=error_response,
-            api_key=api_key,
-            symbol=order_data.get("symbol", ""),
-            exchange=order_data.get("exchange", ""),
-            error_message="Broker-specific module not found",
-        ))
+        bus.publish(
+            OrderFailedEvent(
+                mode="live",
+                api_type="placeorder",
+                request_data=order_request_data,
+                response_data=error_response,
+                api_key=api_key,
+                symbol=order_data.get("symbol", ""),
+                exchange=order_data.get("exchange", ""),
+                error_message="Broker-specific module not found",
+            )
+        )
         return False, error_response, 404
 
     try:
         res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
     except Exception as e:
-        logger.error(f"Error in broker_module.place_order_api: {e}")
-        traceback.print_exc()
+        logger.exception(f"Error in broker_module.place_order_api: {e}")
         error_response = {
             "status": "error",
             "message": "Failed to place order due to internal error",
         }
-        bus.publish(OrderFailedEvent(
-            mode="live",
-            api_type="placeorder",
-            request_data=order_request_data,
-            response_data=error_response,
-            api_key=api_key,
-            symbol=order_data.get("symbol", ""),
-            exchange=order_data.get("exchange", ""),
-            error_message=str(e),
-        ))
+        bus.publish(
+            OrderFailedEvent(
+                mode="live",
+                api_type="placeorder",
+                request_data=order_request_data,
+                response_data=error_response,
+                api_key=api_key,
+                symbol=order_data.get("symbol", ""),
+                exchange=order_data.get("exchange", ""),
+                error_message=str(e),
+            )
+        )
         return False, error_response, 500
 
     if res.status == 200:
         order_response_data = {"status": "success", "orderid": order_id}
 
         if emit_event:
-            bus.publish(OrderPlacedEvent(
-                mode="live",
-                api_type="placeorder",
-                strategy=order_data.get("strategy", ""),
-                symbol=order_data.get("symbol", ""),
-                exchange=order_data.get("exchange", ""),
-                action=order_data.get("action", ""),
-                quantity=int(order_data.get("quantity", 0)),
-                pricetype=order_data.get("pricetype", ""),
-                product=order_data.get("product", ""),
-                orderid=str(order_id),
-                request_data=order_request_data,
-                response_data=order_response_data,
-                api_key=api_key,
-            ))
+            bus.publish(
+                OrderPlacedEvent(
+                    mode="live",
+                    api_type="placeorder",
+                    strategy=order_data.get("strategy", ""),
+                    symbol=order_data.get("symbol", ""),
+                    exchange=order_data.get("exchange", ""),
+                    action=order_data.get("action", ""),
+                    quantity=int(order_data.get("quantity", 0)),
+                    pricetype=order_data.get("pricetype", ""),
+                    product=order_data.get("product", ""),
+                    orderid=str(order_id),
+                    request_data=order_request_data,
+                    response_data=order_response_data,
+                    api_key=api_key,
+                )
+            )
 
         return True, order_response_data, 200
     else:
@@ -242,16 +268,18 @@ def place_order_with_auth(
             else "Failed to place order"
         )
         error_response = {"status": "error", "message": message}
-        bus.publish(OrderFailedEvent(
-            mode="live",
-            api_type="placeorder",
-            request_data=order_request_data,
-            response_data=error_response,
-            api_key=api_key,
-            symbol=order_data.get("symbol", ""),
-            exchange=order_data.get("exchange", ""),
-            error_message=message,
-        ))
+        bus.publish(
+            OrderFailedEvent(
+                mode="live",
+                api_type="placeorder",
+                request_data=order_request_data,
+                response_data=error_response,
+                api_key=api_key,
+                symbol=order_data.get("symbol", ""),
+                exchange=order_data.get("exchange", ""),
+                error_message=message,
+            )
+        )
         return False, error_response, res.status if res.status != 200 else 500
 
 
@@ -261,6 +289,7 @@ def place_order(
     auth_token: str | None = None,
     broker: str | None = None,
     emit_event: bool = True,
+    prefetched_quote: dict[str, Any] | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Place an order with the broker.
@@ -272,6 +301,8 @@ def place_order(
         auth_token: Direct broker authentication token (for internal calls)
         broker: Direct broker name (for internal calls)
         emit_event: Whether to emit socket event (default True, set False for batch orders)
+        prefetched_quote: Pre-fetched quote from batch call (optional, sandbox only).
+            Skips per-order REST API quote fetch when provided.
 
     Returns:
         Tuple containing:
@@ -300,14 +331,16 @@ def place_order(
             return False, emit_analyzer_error(original_data, error_message), 400
         error_response = {"status": "error", "message": error_message}
         safe_request = {k: v for k, v in original_data.items() if k != "apikey"}
-        bus.publish(OrderFailedEvent(
-            mode="live",
-            api_type="placeorder",
-            request_data=safe_request,
-            response_data=error_response,
-            error_message=error_message,
-            api_key=api_key or "",
-        ))
+        bus.publish(
+            OrderFailedEvent(
+                mode="live",
+                api_type="placeorder",
+                request_data=safe_request,
+                response_data=error_response,
+                error_message=error_message,
+                api_key=api_key or "",
+            )
+        )
         return False, error_response, 400
 
     # Case 1: API-based authentication
@@ -318,11 +351,15 @@ def place_order(
             # Skip logging for invalid API keys to prevent database flooding
             return False, error_response, 403
 
-        return place_order_with_auth(order_data, AUTH_TOKEN, broker_name, original_data, emit_event)
+        return place_order_with_auth(
+            order_data, AUTH_TOKEN, broker_name, original_data, emit_event, prefetched_quote
+        )
 
     # Case 2: Direct internal call with auth_token and broker
     elif auth_token and broker:
-        return place_order_with_auth(order_data, auth_token, broker, original_data, emit_event)
+        return place_order_with_auth(
+            order_data, auth_token, broker, original_data, emit_event, prefetched_quote
+        )
 
     # Case 3: Invalid parameters
     else:

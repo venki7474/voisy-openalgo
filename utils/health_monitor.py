@@ -38,9 +38,17 @@ HEALTH_MONITOR_ENABLED = os.getenv("HEALTH_MONITOR_ENABLED", "true").lower() == 
 HEALTH_SAMPLE_INTERVAL = int(os.getenv("HEALTH_SAMPLE_INTERVAL", "10"))  # seconds
 HEALTH_RETENTION_DAYS = int(os.getenv("HEALTH_RETENTION_DAYS", "7"))
 
-# File Descriptor Thresholds
-FD_WARNING_THRESHOLD = int(os.getenv("HEALTH_FD_WARNING_THRESHOLD", "700"))
-FD_CRITICAL_THRESHOLD = int(os.getenv("HEALTH_FD_CRITICAL_THRESHOLD", "900"))
+# File Descriptor / Handle Thresholds
+# Windows handles are NOT Unix FDs — a normal Flask app uses 500-2000+ handles.
+# Use platform-appropriate defaults unless overridden via env.
+import platform as _platform
+_IS_WINDOWS = _platform.system() == "Windows"
+FD_WARNING_THRESHOLD = int(os.getenv(
+    "HEALTH_FD_WARNING_THRESHOLD", "5000" if _IS_WINDOWS else "700"
+))
+FD_CRITICAL_THRESHOLD = int(os.getenv(
+    "HEALTH_FD_CRITICAL_THRESHOLD", "10000" if _IS_WINDOWS else "900"
+))
 
 # Memory Thresholds (MB)
 MEMORY_WARNING_THRESHOLD = int(os.getenv("HEALTH_MEMORY_WARNING_THRESHOLD", "500"))
@@ -62,6 +70,11 @@ THREAD_CRITICAL_THRESHOLD = int(os.getenv("HEALTH_THREAD_CRITICAL_THRESHOLD", "1
 _collector_thread = None
 _collector_running = False
 _collector_lock = threading.Lock()
+
+#: Longest the loop sleeps before re-checking the stop flag, so stopping is
+#: prompt rather than waiting out a whole sampling interval. Matched to the
+#: strategy checkpoint writer, which had the same problem first.
+_STOP_CHECK_SEC = 0.1
 
 # Cached metrics for fast access (updated by background thread)
 _cached_metrics = {
@@ -147,30 +160,36 @@ def check_db_connectivity():
 
 
 def get_fd_metrics():
-    """Get file descriptor metrics (lightweight, <1ms)"""
+    """Get file descriptor / handle metrics (lightweight, <1ms)"""
     try:
         process = psutil.Process(os.getpid())
 
-        # Get FD count (Unix/Linux/macOS only)
+        # Get FD count (Unix) or handle count (Windows)
         if hasattr(process, "num_fds"):
             fd_count = process.num_fds()
         else:
-            # Windows - count handles instead
+            # Windows - count handles (includes threads, mutexes, registry keys, etc.)
             fd_count = process.num_handles() if hasattr(process, "num_handles") else 0
 
-        # Get FD limit
+        # Get FD limit — only meaningful on Unix
         if hasattr(os, "sysconf") and hasattr(os, "sysconf_names"):
             if "SC_OPEN_MAX" in os.sysconf_names:
                 fd_limit = os.sysconf("SC_OPEN_MAX")
             else:
                 fd_limit = 1024  # Default
         else:
-            fd_limit = 16777216  # Windows default
+            # Windows has no process-level handle limit — set to None
+            fd_limit = None
 
-        fd_usage_percent = (fd_count / fd_limit * 100) if fd_limit else 0
-        fd_available = fd_limit - fd_count
+        if fd_limit:
+            fd_usage_percent = fd_count / fd_limit * 100
+            fd_available = fd_limit - fd_count
+        else:
+            fd_usage_percent = 0.0
+            fd_available = None
 
-        # Determine status
+        # Determine status using absolute thresholds (platform-aware defaults)
+        metric_label = "Handle" if _IS_WINDOWS else "File descriptor"
         if fd_count >= FD_CRITICAL_THRESHOLD:
             status = "fail"
             HealthAlert.create_alert(
@@ -179,7 +198,7 @@ def get_fd_metrics():
                 metric_name="fd_count",
                 metric_value=fd_count,
                 threshold_value=FD_CRITICAL_THRESHOLD,
-                message=f"File descriptor count critical: {fd_count}/{fd_limit} ({fd_usage_percent:.1f}%)",
+                message=f"{metric_label} count critical: {fd_count} (threshold: {FD_CRITICAL_THRESHOLD})",
             )
         elif fd_count >= FD_WARNING_THRESHOLD:
             status = "warn"
@@ -189,7 +208,7 @@ def get_fd_metrics():
                 metric_name="fd_count",
                 metric_value=fd_count,
                 threshold_value=FD_WARNING_THRESHOLD,
-                message=f"File descriptor count elevated: {fd_count}/{fd_limit} ({fd_usage_percent:.1f}%)",
+                message=f"{metric_label} count elevated: {fd_count} (threshold: {FD_WARNING_THRESHOLD})",
             )
         else:
             status = "pass"
@@ -204,7 +223,7 @@ def get_fd_metrics():
         }
     except Exception as e:
         logger.error(f"Error getting FD metrics: {e}")
-        return {"count": 0, "limit": 0, "usage_percent": 0, "available": 0, "status": "unknown"}
+        return {"count": 0, "limit": None, "usage_percent": 0.0, "available": None, "status": "unknown"}
 
 
 def get_memory_metrics():
@@ -382,6 +401,33 @@ def get_websocket_metrics():
             pass  # WebSocket proxy not available
         except Exception:
             pass  # Error checking WebSocket connections
+
+        # Cross-process fallback: the WS proxy runs in its own process, so
+        # the in-process pools above are always empty under the current
+        # architecture. The proxy writes a snapshot file every ~10s
+        # (websocket_proxy/server.py _stats_file_writer, GitHub issue #1301).
+        if total_connections == 0 and total_symbols == 0:
+            try:
+                import json as _json
+
+                stats_path = os.getenv(
+                    "WS_PROXY_STATS_FILE", os.path.join("log", "ws_proxy_stats.json")
+                )
+                with open(stats_path) as f:
+                    snapshot = _json.load(f)
+                # Ignore stale snapshots (proxy stopped or file left behind).
+                if time.time() - float(snapshot.get("timestamp", 0)) < 60:
+                    total_connections = int(snapshot.get("total_connections", 0))
+                    total_symbols = int(snapshot.get("total_symbols", 0))
+                    broker_counts: dict = {}
+                    for b in snapshot.get("brokers", []):
+                        broker_counts[b] = broker_counts.get(b, 0) + 1
+                    for b, n in broker_counts.items():
+                        connections[b] = {"broker": b, "count": n, "symbols": total_symbols}
+            except FileNotFoundError:
+                pass  # Proxy not started yet / never wrote a snapshot
+            except Exception:
+                pass  # Malformed snapshot — keep zeros rather than crash
 
         # Determine status
         if total_connections >= WS_CRITICAL_THRESHOLD:
@@ -572,6 +618,22 @@ def collect_metrics():
         health_session.remove()
 
 
+def _sleep(seconds):
+    """Sleep in slices, so stopping does not wait out a sampling interval.
+
+    ``stop_health_collector`` clears the flag and joins for five seconds. A
+    single ``time.sleep(HEALTH_SAMPLE_INTERVAL)`` cannot see the flag while it
+    is running, so with the default interval of ten seconds the join timed out
+    every time and Ctrl+C paid five seconds before the rest of the teardown
+    even started.
+    """
+    remaining = seconds
+    while _collector_running and remaining > 0:
+        slice_ = min(_STOP_CHECK_SEC, remaining)
+        time.sleep(slice_)
+        remaining -= slice_
+
+
 def _collector_loop():
     """Background collector loop (daemon thread, low priority)"""
     global _collector_running
@@ -584,8 +646,9 @@ def _collector_loop():
         except Exception as e:
             logger.exception(f"Error in collector loop: {e}")
 
-        # Sleep for interval (releases GIL, zero impact on API/WebSocket)
-        time.sleep(HEALTH_SAMPLE_INTERVAL)
+        # Sliced, so a stop lands within _STOP_CHECK_SEC rather than within
+        # HEALTH_SAMPLE_INTERVAL. Still releases the GIL the same way.
+        _sleep(HEALTH_SAMPLE_INTERVAL)
 
     logger.info("Health monitoring collector stopped")
 
@@ -601,7 +664,7 @@ def start_health_collector(interval=None):
     global _collector_thread, _collector_running, HEALTH_SAMPLE_INTERVAL
 
     if not HEALTH_MONITOR_ENABLED:
-        logger.info("Health monitoring is disabled (HEALTH_MONITOR_ENABLED=false)")
+        logger.debug("Health monitoring is disabled (HEALTH_MONITOR_ENABLED=false)")
         return
 
     if interval:

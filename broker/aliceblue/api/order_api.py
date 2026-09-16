@@ -2,7 +2,12 @@ import json
 import os
 
 import httpx
+import threading
+import weakref
+import time
 
+from broker.aliceblue.api.error_codes import describe
+from broker.aliceblue.api.rate_limiter import apply_rate_limit
 from broker.aliceblue.mapping.order_data import (
     normalize_holding,
     normalize_order,
@@ -29,8 +34,17 @@ BASE_URL = "https://a3.aliceblueonline.com"
 # ─── API request helper ──────────────────────────────────────────────────────
 
 def get_api_response(endpoint, auth, method="GET", payload=None):
-    """Make API requests to AliceBlue V2 API using shared connection pooling."""
+    """Make API requests to AliceBlue V2 API using shared connection pooling.
+
+    Rate limited. This helper carries the reads - orderbook, tradebook,
+    holdings, positions, funds - which fall under AliceBlue's "all other
+    requests" budget of 1800 per 15 minutes. Placing, modifying and cancelling
+    build their own URLs and never come through here, which is what we want:
+    the broker does not limit those, and throttling an exit to protect a quota
+    would be the wrong trade.
+    """
     try:
+        apply_rate_limit()
         client = get_httpx_client()
         url = f"{BASE_URL}{endpoint}"
 
@@ -82,7 +96,9 @@ def _extract_result(response_data):
         if response_data.get("status") == "Ok":
             return response_data.get("result", [])
         else:
-            msg = response_data.get("message", "Unknown error")
+            # AliceBlue answers with a bare code like "EC912"; expand it so the
+            # log and the surfaced error say what actually went wrong.
+            msg = describe(response_data.get("message", "Unknown error"))
             logger.error(f"API error: {msg}")
             return None
     return response_data  # fallback: return as-is if not a dict
@@ -100,7 +116,7 @@ def get_order_book(auth):
         # Treat "Failed to retrieve" as empty, not an error
         msg = response.get("message", "")
         if "Failed to retrieve" in msg or "No orders" in msg.lower():
-            logger.info(f"No orders found: {msg}")
+            logger.debug(f"No orders found: {msg}")
             return []
         return {"stat": "Not_Ok", "emsg": msg or "Failed to fetch order book"}
 
@@ -116,14 +132,14 @@ def get_trade_book(auth):
     response = get_api_response("/open-api/od/v1/orders/trades", auth)
     result = _extract_result(response)
 
-    logger.info(f"AliceBlue tradebook API response type: {type(response)}")
+    logger.debug(f"AliceBlue tradebook API response type: {type(response)}")
 
     if result is None:
         # V2 API returns error message when there are no trades
         # Treat "No trades found" as empty, not an error
         msg = response.get("message", "")
         if "No trades" in msg or "not found" in msg.lower():
-            logger.info(f"No trades found: {msg}")
+            logger.debug(f"No trades found: {msg}")
             return []
         return {"stat": "Not_Ok", "emsg": msg or "Failed to fetch trade book"}
 
@@ -143,7 +159,7 @@ def get_positions(auth):
         # V2 API returns error message when there are no positions
         msg = response.get("message", "")
         if "No position" in msg or "not found" in msg.lower() or "Failed to retrieve" in msg:
-            logger.info(f"No positions found: {msg}")
+            logger.debug(f"No positions found: {msg}")
             return []
         return {"stat": "Not_Ok", "emsg": msg or "Failed to fetch positions"}
 
@@ -163,7 +179,7 @@ def get_holdings(auth):
         # V2 API returns error message when there are no holdings
         msg = response.get("message", "")
         if "No holding" in msg or "not found" in msg.lower() or "Failed to retrieve" in msg:
-            logger.info(f"No holdings found: {msg}")
+            logger.debug(f"No holdings found: {msg}")
             return []
         return {"stat": "Not_Ok", "emsg": msg or "Failed to fetch holdings"}
 
@@ -173,6 +189,74 @@ def get_holdings(auth):
     return [normalize_holding(h) for h in result]
 
 
+# --- Per-Symbol Smart Order Lock ---
+# Ensures only one smart order per symbol executes at a time.
+# Others queue and execute sequentially, each getting a fresh position book.
+#
+# WeakValueDictionary, not a plain dict: the key space is
+# symbol:exchange:product, which is unbounded, and a plain dict kept one
+# threading.Lock per symbol ever smart-ordered for the life of the worker.
+# Entries now disappear once no caller holds the lock, so the registry tracks
+# symbols being ordered right now rather than every symbol ever ordered.
+#
+# Do NOT swap this for a size-capped dict. Evicting a lock a thread is holding
+# hands the next caller a brand-new lock, both run the same symbol's smart
+# order concurrently against a stale position book, and the position is sized
+# twice. Weak references cannot do that: while any caller holds the lock it
+# holds a strong reference, so the entry survives. Same reasoning as
+# services/flow_executor_service._workflow_locks (issue #1739).
+_symbol_locks: "weakref.WeakValueDictionary[str, threading.Lock]" = (
+    weakref.WeakValueDictionary()
+)
+_symbol_locks_lock = threading.Lock()
+
+# --- Position Book Cache ---
+# Caches get_positions() for 1 second. Invalidated after each smart order placement.
+_position_cache = {}        # {auth_token: {"data": ..., "timestamp": ...}}
+_position_cache_lock = threading.Lock()
+_POSITION_CACHE_TTL = 1.0   # seconds
+
+
+def _get_symbol_lock(symbol, exchange, product):
+    """Get or create a per-symbol lock for serializing smart orders.
+
+    Callers must keep the returned lock referenced for the whole critical
+    section (``lock = _get_symbol_lock(...); with lock:``) - that reference is
+    what keeps the registry entry alive. Re-fetching mid-section would not be
+    safe.
+    """
+    key = f"{symbol}:{exchange}:{product}"
+    with _symbol_locks_lock:
+        lock = _symbol_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _symbol_locks[key] = lock
+        return lock
+
+
+def _get_cached_positions(auth):
+    """Get positions from cache if fresh, otherwise fetch from broker API."""
+    with _position_cache_lock:
+        now = time.monotonic()
+        cached = _position_cache.get(auth)
+        if cached and (now - cached["timestamp"]) < _POSITION_CACHE_TTL:
+            return cached["data"]
+
+    # Cache miss or expired - fetch from broker
+    positions_data = get_positions(auth)
+
+    with _position_cache_lock:
+        _position_cache[auth] = {"data": positions_data, "timestamp": time.monotonic()}
+
+    return positions_data
+
+
+def _invalidate_position_cache(auth):
+    """Invalidate the position cache so the next queued order fetches fresh data."""
+    with _position_cache_lock:
+        _position_cache.pop(auth, None)
+
+
 # ─── Open position lookup ────────────────────────────────────────────────────
 
 def get_open_position(tradingsymbol, exchange, product, auth):
@@ -180,11 +264,11 @@ def get_open_position(tradingsymbol, exchange, product, auth):
     # Convert Trading Symbol from OpenAlgo Format to Broker Format Before Search
     tradingsymbol = get_br_symbol(tradingsymbol, exchange)
 
-    position_data = get_positions(auth)
+    position_data = _get_cached_positions(auth)
 
     if isinstance(position_data, dict):
         if position_data.get("stat") == "Not_Ok":
-            logger.info(f"Error fetching position data: {position_data.get('emsg')}")
+            logger.debug(f"Error fetching position data: {position_data.get('emsg')}")
             position_data = {}
 
     net_qty = "0"
@@ -197,7 +281,7 @@ def get_open_position(tradingsymbol, exchange, product, auth):
                 and position.get("Pcode") == product
             ):
                 net_qty = position.get("Netqty", "0")
-                logger.info(f"Net Quantity {net_qty}")
+                logger.debug(f"Net Quantity {net_qty}")
                 break
 
     return net_qty
@@ -241,7 +325,7 @@ def place_order_api(data, auth):
                     logger.error(f"Order placement failed (result error {result_status}): {error_msg}")
                 else:
                     orderid = result_item.get("brokerOrderId")
-                    logger.info(f"Order placed successfully: {orderid}")
+                    logger.debug(f"Order placed successfully: {orderid}")
         else:
             error_msg = response_data.get("message", "No error message provided by API")
             logger.error(f"Order placement failed: {error_msg}")
@@ -275,71 +359,77 @@ def place_smartorder_api(data, auth):
     symbol = data.get("symbol")
     exchange = data.get("exchange")
     product = data.get("product")
-    position_size = int(data.get("position_size", "0"))
+    # Per-symbol lock: serialize smart orders per symbol
+    symbol_lock = _get_symbol_lock(symbol, exchange, product)
 
-    # Get current open position for the symbol
-    current_position = int(
-        get_open_position(symbol, exchange, reverse_map_product_type(map_product_type(product)), AUTH_TOKEN)
-    )
+    with symbol_lock:
+        position_size = int(data.get("position_size", "0"))
 
-    logger.info(f"position_size : {position_size}")
-    logger.info(f"Open Position : {current_position}")
+        # Get current open position for the symbol
+        current_position = int(
+            get_open_position(symbol, exchange, reverse_map_product_type(map_product_type(product)), AUTH_TOKEN)
+        )
 
-    # Determine action based on position_size and current_position
-    action = None
-    quantity = 0
+        logger.debug(f"position_size : {position_size}")
+        logger.debug(f"Open Position : {current_position}")
 
-    # If both position_size and current_position are 0, do nothing
-    if position_size == 0 and current_position == 0 and int(data["quantity"]) != 0:
-        action = data["action"]
-        quantity = data["quantity"]
-        res, response, orderid = place_order_api(data, AUTH_TOKEN)
-        return res, response, orderid
+        # Determine action based on position_size and current_position
+        action = None
+        quantity = 0
 
-    elif position_size == current_position:
-        if int(data["quantity"]) == 0:
-            response = {
-                "status": "success",
-                "message": "No OpenPosition Found. Not placing Exit order.",
-            }
-        else:
-            response = {
-                "status": "success",
-                "message": "No action needed. Position size matches current position",
-            }
-        orderid = None
-        return res, response, orderid
+        # If both position_size and current_position are 0, do nothing
+        if position_size == 0 and current_position == 0 and int(data["quantity"]) != 0:
+            action = data["action"]
+            quantity = data["quantity"]
+            res, response, orderid = place_order_api(data, AUTH_TOKEN)
+            _invalidate_position_cache(AUTH_TOKEN)
+            return res, response, orderid
 
-    if position_size == 0 and current_position > 0:
-        action = "SELL"
-        quantity = abs(current_position)
-    elif position_size == 0 and current_position < 0:
-        action = "BUY"
-        quantity = abs(current_position)
-    elif current_position == 0:
-        action = "BUY" if position_size > 0 else "SELL"
-        quantity = abs(position_size)
-    else:
-        if position_size > current_position:
-            action = "BUY"
-            quantity = position_size - current_position
-        elif position_size < current_position:
+        elif position_size == current_position:
+            if int(data["quantity"]) == 0:
+                response = {
+                    "status": "success",
+                    "message": "No OpenPosition Found. Not placing Exit order.",
+                }
+            else:
+                response = {
+                    "status": "success",
+                    "message": "No action needed. Position size matches current position",
+                }
+            orderid = None
+            return res, response, orderid
+
+        if position_size == 0 and current_position > 0:
             action = "SELL"
-            quantity = current_position - position_size
+            quantity = abs(current_position)
+        elif position_size == 0 and current_position < 0:
+            action = "BUY"
+            quantity = abs(current_position)
+        elif current_position == 0:
+            action = "BUY" if position_size > 0 else "SELL"
+            quantity = abs(position_size)
+        else:
+            if position_size > current_position:
+                action = "BUY"
+                quantity = position_size - current_position
+            elif position_size < current_position:
+                action = "SELL"
+                quantity = current_position - position_size
 
-    if action:
-        # Prepare data for placing the order
-        order_data = data.copy()
-        order_data["action"] = action
-        order_data["quantity"] = str(quantity)
+        if action:
+            # Prepare data for placing the order
+            order_data = data.copy()
+            order_data["action"] = action
+            order_data["quantity"] = str(quantity)
 
-        # Place the order
-        res, response, orderid = place_order_api(order_data, AUTH_TOKEN)
+            # Place the order
+            res, response, orderid = place_order_api(order_data, AUTH_TOKEN)
+            _invalidate_position_cache(AUTH_TOKEN)
 
-        return res, response, orderid
+            return res, response, orderid
 
 
-# ─── Close all positions ──────────────────────────────────────────────────────
+    # ─── Close all positions ──────────────────────────────────────────────────────
 
 def close_all_positions(current_api_key, auth):
     AUTH_TOKEN = auth
@@ -348,7 +438,7 @@ def close_all_positions(current_api_key, auth):
 
     if isinstance(positions_response, dict):
         if positions_response.get("stat") == "Not_Ok":
-            logger.info(f"Error fetching position data: {positions_response.get('emsg')}")
+            logger.debug(f"Error fetching position data: {positions_response.get('emsg')}")
             positions_response = {}
 
     # Check if the positions data is null or empty
@@ -380,12 +470,12 @@ def close_all_positions(current_api_key, auth):
                 "quantity": str(quantity),
             }
 
-            logger.info(f"{place_order_payload}")
+            logger.debug(f"{place_order_payload}")
 
             # Place the order to close the position
             _, api_response, _ = place_order_api(place_order_payload, AUTH_TOKEN)
 
-            logger.info(f"{api_response}")
+            logger.debug(f"{api_response}")
 
     return {"status": "success", "message": "All Open Positions SquaredOff"}, 200
 
@@ -495,7 +585,7 @@ def cancel_all_orders_api(data, auth):
     orders_to_cancel = [
         order for order in order_book_response if order.get("Status") in ["open", "trigger pending"]
     ]
-    logger.info(f"{orders_to_cancel}")
+    logger.debug(f"{orders_to_cancel}")
     canceled_orders = []
     failed_cancellations = []
 
