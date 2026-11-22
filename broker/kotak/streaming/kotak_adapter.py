@@ -17,6 +17,43 @@ from .sfeed_websocket import KotakSFeedWebSocket
 
 logger = get_logger(__name__)
 
+# Kotak's own names for the indices, which is how the index feed addresses them:
+# "nse_cm|Nifty 50", not the master-contract token. The names are not derivable
+# from the master contract, which stores the short ticker.
+#
+# broker/kotak/api/data.py holds the same map for the quotes endpoint. The two
+# are deliberately separate copies -- the streaming path cannot import that
+# module, which pulls in httpx, the token database and the master contract --
+# and test_kotak_index_feed_subscription.py compares them so a drift fails a
+# test rather than silently subscribing a name Kotak does not know.
+_INDEX_NAMES = {
+    "NIFTY": ["Nifty 50"],
+    "NIFTY50": ["Nifty 50"],
+    "BANKNIFTY": ["Nifty Bank"],
+    "FINNIFTY": ["Nifty Fin Service"],
+    "MIDCPNIFTY": [
+        "Nifty Mid Select",
+        "Nifty Midcap Sel",
+        "Nifty Midcap Select",
+        "NIFTY MID SELECT",
+    ],
+    "NIFTYNXT50": ["Nifty Next 50"],
+    "INDIAVIX": ["India VIX"],
+    "SENSEX": ["SENSEX"],
+    "BANKEX": ["BANKEX"],
+}
+
+
+def index_name_candidates(symbol):
+    """Kotak's candidate names for an OpenAlgo index symbol, best first."""
+    return _INDEX_NAMES.get((symbol or "").upper(), [symbol])
+
+
+def is_index_exchange(exchange):
+    """Whether an OpenAlgo exchange names indices rather than tradeable scrips."""
+    return (exchange or "").upper().endswith("_INDEX")
+
+
 # HSI scrip operations: sub_type -> (feed family, is_unsubscribe). The family
 # groups a subscribe with its matching unsubscribe so the batcher can collapse
 # them per scrip, while leaving quote/depth/index independent of each other.
@@ -28,6 +65,61 @@ _SCRIP_OPS = {
     "ifs": ("index", False),
     "ifu": ("index", True),
 }
+
+
+# OpenAlgo quote field -> the key the feed clients normalize it to. Published
+# only when the packet state carries it: a field the broker did not send is
+# left out, never filled with a guess.
+_QUOTE_EXTRA_FIELDS = (
+    ("average_price", "ap"),
+    ("percent_change", "nc"),
+    ("last_quantity", "ltq"),
+    ("total_buy_quantity", "totalbuyqty"),
+    ("total_sell_quantity", "totalsellqty"),
+    ("oi", "oi"),
+)
+
+
+# Core quote fields, OpenAlgo name -> merged-state key. Published only when the
+# state holds them.
+_KNOWN_QUOTE_FIELDS = (
+    ("volume", "volume"),
+    ("open", "open"),
+    ("high", "high"),
+    ("low", "low"),
+    ("close", "prev_close"),
+)
+
+
+def _quote_extras(state):
+    """The optional quote fields present in a merged packet state."""
+    return {name: state[key] for name, key in _QUOTE_EXTRA_FIELDS if key in state}
+
+
+def _ltt_millis(state):
+    """The exchange's last trade time in epoch milliseconds, or None.
+
+    The feed clients carry it as "ltt" in Unix seconds. Milliseconds is the
+    unit every other time this adapter publishes uses. A missing or
+    non-numeric value (HSM formats its DATE fields as text) yields None, so the
+    caller leaves the field out instead of substituting the wall clock.
+    """
+    value = state.get("ltt")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return int(value) * 1000
+
+
+def _poll_book(levels):
+    """Up to five depth levels in the polled get_depth() shape."""
+    return {
+        str(i): {
+            "price": str(level.get("price", 0)),
+            "qty": str(level.get("quantity", 0)),
+            "orders": str(level.get("orders", 0)),
+        }
+        for i, level in enumerate(levels[:5], 1)
+    }
 
 
 def _data_center_from(auth_parts):
@@ -91,8 +183,8 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self._running = False
         self._reconnecting = False
         self._reconnect_timer = None
-        self._reconnect_delay = 5        # base delay in seconds
-        self._max_reconnect_delay = 60   # maximum delay in seconds
+        self._reconnect_delay = 5  # base delay in seconds
+        self._max_reconnect_delay = 60  # maximum delay in seconds
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 10
 
@@ -108,6 +200,10 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         # Track active subscription modes per symbol - CRITICAL FOR MULTI-CLIENT SUPPORT
         self._symbol_modes = {}  # {(kotak_exchange, token): set of active modes}
+
+        # Index alias -> every OpenAlgo index subscribed under it, with its
+        # master-contract token: {(kotak_exchange, name): {(exchange, symbol): token}}
+        self._index_alias_targets = {}
 
         # Batch subscription management - debounced fan-in so a burst of
         # subscribe()/unsubscribe() calls collapses into one HSI frame per
@@ -233,8 +329,43 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 on_error=on_error_internal,
             )
 
-    def _on_data_received(self, parsed_data):
-        """Handle received and parsed market data - FIXED for partial updates like AliceBlue."""
+    def _index_targets_for(self, broker_exchange, token, feed_name):
+        """Every OpenAlgo index subscribed under the alias this tick carries.
+
+        Caller holds self._lock. Two OpenAlgo symbols can name the same Kotak
+        index (NIFTY and NIFTY50 both subscribe "nse_cm|Nifty 50"), and the
+        single-valued _kotak_to_openalgo entry for the name holds whichever
+        subscribed last, so the other one would never receive a tick.
+        """
+        aliases = self._alias_registry()
+        if not aliases:
+            return []
+        targets = aliases.get((broker_exchange, token))
+        if not targets and feed_name:
+            targets = aliases.get((broker_exchange, feed_name))
+        if not targets:
+            return []
+        return [(exchange, symbol, tok) for (exchange, symbol), tok in targets.items()]
+
+    def _alias_registry(self):
+        """{(kotak_exchange, index name): {(exchange, symbol): token}}.
+
+        Created on first use as well as in __init__, so an adapter built
+        without __init__ (as the tests do) still has one.
+        """
+        registry = self.__dict__.get("_index_alias_targets")
+        if registry is None:
+            registry = self.__dict__["_index_alias_targets"] = {}
+        return registry
+
+    def _on_data_received(self, parsed_data, _target=None):
+        """Merge one normalized packet into the symbol's state and publish it.
+
+        Args:
+            parsed_data: a dict from the feed client (or a list of them).
+            _target: internal. The (exchange, symbol) an index alias tick was
+                fanned out to; set only by the fan-out below.
+        """
         try:
             logger.debug(f"Data received: {parsed_data}")
 
@@ -250,9 +381,39 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
             # Extract key identifiers - following AliceBlue pattern
             token = str(parsed_data.get("tk", ""))
             broker_exchange = parsed_data.get("e", "UNKNOWN")
+            feed_name = str(parsed_data.get("ts", "") or "")
+
+            # An index tick goes to every OpenAlgo symbol subscribed under its
+            # alias, each keyed by its own master-contract token so its state,
+            # caches and modes stay its own.
+            if _target is None:
+                with self._lock:
+                    targets = self._index_targets_for(broker_exchange, token, feed_name)
+                if targets:
+                    for exchange, symbol, target_token in targets:
+                        self._on_data_received(
+                            {**parsed_data, "tk": target_token}, _target=(exchange, symbol)
+                        )
+                    return
+
+            # An index names itself. Its packet carries a token of Kotak's own
+            # choosing rather than the master-contract one -- NIFTY subscribed
+            # as "nse_cm|Nifty 50" answers with tk 4247863880, not 26000 -- so
+            # keying on the token alone matches no subscription and the tick is
+            # dropped, which looks exactly like the feed never sending one. The
+            # name is the identity we subscribed under, so fall back to it.
+            with self._lock:
+                known = (broker_exchange, token) in self._kotak_to_openalgo
+                by_name = (
+                    bool(feed_name) and (broker_exchange, feed_name) in self._kotak_to_openalgo
+                )
+            if _target is None and not known and by_name:
+                token = feed_name
+
             ltp = parsed_data.get("ltp")
 
-            # **CRITICAL FIX**: Check if this is depth data (has bids/asks) or LTP data
+            # Depth comes from a depth packet only. Decided before the merge
+            # below, which carries the last book along in the stored state.
             has_depth_data = "bids" in parsed_data and "asks" in parsed_data
             has_ltp_data = ltp and float(ltp) > 0
 
@@ -261,6 +422,8 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
             # --- Lock section 1: State merging and write-back ---
             with self._lock:
+                mapped = _target or self._kotak_to_openalgo.get((broker_exchange, token))
+
                 # Check if this is a partial update by detecting missing expected fields
                 is_partial_update = self._is_partial_update(parsed_data)
 
@@ -268,25 +431,21 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 if is_partial_update and symbol_key not in self._symbol_state:
                     logger.debug(f"Initializing state for partial update: {symbol_key}")
                     # Create initial state with proper default values
+                    # Only fields the packet carried go in: a price or volume
+                    # it left out is unknown, not 0, and a 0 here would be
+                    # published to quote subscribers as if it were real.
                     initial_state = {
                         "tk": parsed_data.get("tk", ""),
                         "e": parsed_data.get("e", ""),
                         "ts": parsed_data.get("ts", ""),
-                        "ltp": 0.0,
-                        "open": 0.0,
-                        "high": 0.0,
-                        "low": 0.0,
-                        "prev_close": 0.0,
-                        "volume": 0.0,
-                        "bid": 0.0,
-                        "ask": 0.0,
                         "bids": [],
                         "asks": [],
                     }
+                    seeded = ("ltp", "open", "high", "low", "prev_close", "volume", "bid", "ask")
 
                     # **CRITICAL**: Copy any non-zero/non-empty values from the partial update
                     for key, value in parsed_data.items():
-                        if key in initial_state:
+                        if key in initial_state or key in seeded:
                             # Don't overwrite with zero values for price fields
                             if key in ["open", "high", "low", "prev_close", "bid", "ask"]:
                                 if value != 0.0 and value != 21474836.48:  # Kotak's invalid value
@@ -306,70 +465,10 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
                     self._symbol_state[symbol_key] = initial_state
 
-                # --- CRITICAL: Merge depth levels per level, not just per side ---
-                if has_depth_data:
-                    prev_state = self._symbol_state.get(symbol_key, {})
-                    prev_bids = prev_state.get("bids", []) if prev_state else []
-                    prev_asks = prev_state.get("asks", []) if prev_state else []
-                    new_bids = parsed_data.get("bids", [])
-                    new_asks = parsed_data.get("asks", [])
-                    merged_bids = []
-                    merged_asks = []
-                    for i in range(5):
-                        # --- BUY SIDE ---
-                        if i < len(new_bids):
-                            b = new_bids[i]
-                            prev_b = (
-                                prev_bids[i]
-                                if i < len(prev_bids)
-                                else {"price": 0, "quantity": 0, "orders": 0}
-                            )
-                            merged_bids.append(
-                                {
-                                    "price": b.get("price", 0)
-                                    if b.get("price", 0) != 0
-                                    else prev_b.get("price", 0),
-                                    "quantity": b.get("quantity", 0)
-                                    if b.get("quantity", 0) != 0
-                                    else prev_b.get("quantity", 0),
-                                    "orders": b.get("orders", 0)
-                                    if b.get("orders", 0) != 0
-                                    else prev_b.get("orders", 0),
-                                }
-                            )
-                        elif i < len(prev_bids):
-                            merged_bids.append(prev_bids[i])
-                        else:
-                            merged_bids.append({"price": 0, "quantity": 0, "orders": 0})
-
-                        # --- SELL SIDE ---
-                        if i < len(new_asks):
-                            a = new_asks[i]
-                            prev_a = (
-                                prev_asks[i]
-                                if i < len(prev_asks)
-                                else {"price": 0, "quantity": 0, "orders": 0}
-                            )
-                            merged_asks.append(
-                                {
-                                    "price": a.get("price", 0)
-                                    if a.get("price", 0) != 0
-                                    else prev_a.get("price", 0),
-                                    "quantity": a.get("quantity", 0)
-                                    if a.get("quantity", 0) != 0
-                                    else prev_a.get("quantity", 0),
-                                    "orders": a.get("orders", 0)
-                                    if a.get("orders", 0) != 0
-                                    else prev_a.get("orders", 0),
-                                }
-                            )
-                        elif i < len(prev_asks):
-                            merged_asks.append(prev_asks[i])
-                        else:
-                            merged_asks.append({"price": 0, "quantity": 0, "orders": 0})
-                    # Update parsed_data with merged depth
-                    parsed_data["bids"] = merged_bids
-                    parsed_data["asks"] = merged_asks
+                # A depth packet is the whole book, so its levels replace the
+                # previous ones outright. Filling an empty level from the last
+                # packet resurrected levels the exchange had already removed,
+                # leaving stale and even crossed prices in the ladder.
 
                 # **CRITICAL FIX FOR PARTIAL UPDATES**: Implement AliceBlue-style state merging
                 if is_partial_update and symbol_key in self._symbol_state:
@@ -398,10 +497,17 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     ltp = parsed_data.get("ltp")
                     has_depth_data = "bids" in parsed_data and "asks" in parsed_data
                     has_ltp_data = ltp and float(ltp) > 0
+                elif symbol_key in self._symbol_state:
+                    # A complete packet still need not carry every field: the
+                    # mini touch line has a price but no open, high, low,
+                    # volume or book. What it leaves out is unchanged, so it
+                    # is laid over the last known state rather than replacing
+                    # it, and a field it does carry always wins.
+                    parsed_data = {**self._symbol_state[symbol_key], **parsed_data}
 
                 # Store the complete data only for mapped symbols (avoids unbounded growth
                 # from unsolicited broker data for symbols we're not subscribed to)
-                if (broker_exchange, token) in self._kotak_to_openalgo:
+                if mapped is not None:
                     self._symbol_state[symbol_key] = {
                         **parsed_data,
                         "bids": parsed_data.get("bids", []),
@@ -418,8 +524,8 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
             publish_queue = []
 
             with self._lock:
-                if mapping_key in self._kotak_to_openalgo:
-                    exchange, symbol = self._kotak_to_openalgo[mapping_key]
+                if mapped is not None:
+                    exchange, symbol = mapped
                     cache_key = (exchange, symbol)
 
                     # For LTP data, update LTP cache
@@ -447,7 +553,9 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     # Snapshot active modes and cached depth for publish queue building
                     active_modes = set(self._symbol_modes.get(mapping_key, set()))
                     effective_ltp = float(ltp) if has_ltp_data else cached_ltp
-                    local_depth_cache = self._depth_cache.get(cache_key, {}).copy() if not has_depth_data else None
+                    local_depth_cache = (
+                        self._depth_cache.get(cache_key, {}).copy() if not has_depth_data else None
+                    )
                 else:
                     exchange = symbol = cache_key = None
                     active_modes = set()
@@ -456,44 +564,80 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
             # --- Build publish queue outside lock (pure computation on local data) ---
             if exchange and symbol:
+                # The exchange's own last trade time, never the wall clock. It
+                # is left out when the packet has none (no trade yet).
+                trade_time = _ltt_millis(parsed_data)
+                extras = _quote_extras(parsed_data)
+                # OHLC, volume and previous close only once a packet has
+                # carried them: a first mini touch line has a price and none
+                # of these, and sending 0 would read as a real value.
+                known_quote = {
+                    name: parsed_data[key]
+                    for name, key in _KNOWN_QUOTE_FIELDS
+                    if key in parsed_data
+                }
+
                 for mode in active_modes:
                     mode_map = {1: "LTP", 2: "QUOTE", 3: "DEPTH"}
                     mode_str = mode_map.get(mode, "LTP")
                     topic = f"{exchange}_{symbol}_{mode_str}"
 
                     if mode == 1 and has_ltp_data:
-                        publish_data = {
-                            "ltp": float(ltp),
-                            "ltt": parsed_data.get("timestamp", int(time.time() * 1000)),
-                        }
+                        publish_data = {"ltp": float(ltp)}
+                        if trade_time is not None:
+                            publish_data["ltt"] = trade_time
                     elif mode == 2:
                         # Same contract point as mode 3 below: a quote payload
                         # always carries ltp, defaulted to 0. Gating the whole
                         # publish on a non-zero price meant a mode-2 subscriber
                         # received nothing at all - not even the book's OHLC and
                         # volume - until the instrument's first trade of the day.
-                        publish_data = {
-                            "ltp": effective_ltp,
-                            "ltt": parsed_data.get("timestamp", int(time.time() * 1000)),
-                            "volume": parsed_data.get("volume", 0),
-                            "open": parsed_data.get("open", 0.0),
-                            "high": parsed_data.get("high", 0.0),
-                            "low": parsed_data.get("low", 0.0),
-                            "close": parsed_data.get("prev_close", 0.0),
-                        }
+                        publish_data = {"ltp": effective_ltp, **known_quote, **extras}
+                        if trade_time is not None:
+                            publish_data["ltt"] = trade_time
+                            publish_data["last_trade_time"] = trade_time
                     elif mode == 3:
+                        # An index has no order book, so the only thing a depth
+                        # frame can carry for one is its price. Kotak still sends
+                        # a book: subscribing NSE_INDEX:NIFTY returns a snapshot
+                        # of five zero levels, which satisfies has_depth_data
+                        # below. The price rides a separate packet that only
+                        # arrives while the index is ticking, so outside market
+                        # hours the pair produces a frame reading ltp 0.0 over an
+                        # empty ladder -- no information at all, and it overwrote
+                        # the REST spot the option chain had already rendered
+                        # (NIFTY Spot showing 0.00 while Zerodha showed a price).
+                        # Nothing to say is better than saying zero.
+                        if exchange.endswith("_INDEX") and not effective_ltp:
+                            continue
+
                         # Use current depth data or fall back to cached depth
-                        # (Kotak sends depth and LTP as separate packets)
+                        # (Kotak sends depth and LTP as separate packets). The
+                        # book totals ride every market picture, the touch line
+                        # included, so they come from the merged state below.
                         if has_depth_data:
                             depth_buy = parsed_data.get("bids", [])
                             depth_sell = parsed_data.get("asks", [])
-                            depth_total_buy = parsed_data.get("totalbuyqty", 0)
-                            depth_total_sell = parsed_data.get("totalsellqty", 0)
                         elif local_depth_cache:
                             depth_buy = local_depth_cache.get("buy", [])
                             depth_sell = local_depth_cache.get("sell", [])
-                            depth_total_buy = local_depth_cache.get("totalbuyqty", 0)
-                            depth_total_sell = local_depth_cache.get("totalsellqty", 0)
+                        elif exchange.endswith("_INDEX") and has_ltp_data:
+                            # An index has no order book, so it never satisfies
+                            # either branch above and used to fall through to the
+                            # `continue` below -- a Depth subscription to NIFTY
+                            # received nothing at all, ever. The option chain
+                            # subscribes its underlying in Depth mode alongside
+                            # the strikes, so the spot never got a tick and the
+                            # page kept the zero it starts with: NIFTY Spot
+                            # rendered from the REST poll and then read 0.00.
+                            #
+                            # Zerodha routes indices through a dedicated
+                            # _transform_index_tick that publishes the price in
+                            # full/Depth mode with no book, which is why the same
+                            # chain shows a spot there. Same thing here: the
+                            # price is real, the ladder is genuinely empty.
+                            depth_buy = []
+                            depth_sell = []
                         else:
                             continue  # No depth data available at all
 
@@ -511,16 +655,24 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                         # carrying ltp, so a payload without the key is read as
                         # "keep polling" and nothing can ever clear it
                         # (issue #2038).
+                        #
+                        # The proxy also serves Depth frames to Quote and LTP
+                        # subscribers, so a Depth payload carries every quote
+                        # field as well.
                         publish_data = {
-                            "timestamp": int(time.time() * 1000),
                             "ltp": effective_ltp,
+                            **known_quote,
+                            **extras,
                             "depth": {
                                 "buy": depth_buy,
                                 "sell": depth_sell,
                             },
-                            "totalbuyqty": depth_total_buy,
-                            "totalsellqty": depth_total_sell,
+                            "totalbuyqty": extras.get("total_buy_quantity", 0),
+                            "totalsellqty": extras.get("total_sell_quantity", 0),
                         }
+                        if trade_time is not None:
+                            publish_data["ltt"] = trade_time
+                            publish_data["last_trade_time"] = trade_time
                     else:
                         continue
                     publish_data.update(
@@ -544,8 +696,8 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 logger.debug(f"Publishing to ZMQ topic: {topic}")
                 self.publish_market_data(topic, publish_data)
 
-        except Exception as e:
-            logger.error(f"Error processing received data: {e}")
+        except Exception:
+            logger.exception("Error processing received Kotak market data")
 
     def _is_partial_update(self, parsed_data):
         """
@@ -575,11 +727,66 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
         if self._batch_timer:
             self._batch_timer.cancel()
 
-        self._batch_timer = threading.Timer(
-            self._batch_delay, self._process_batch_subscriptions
-        )
+        self._batch_timer = threading.Timer(self._batch_delay, self._process_batch_subscriptions)
         self._batch_timer.daemon = True
         self._batch_timer.start()
+
+    def _index_feed_names(self, kotak_exchange, exchange, symbol, token, register=True):
+        """The index name(s) to subscribe, registering how their ticks map back.
+
+        Only the first candidate is subscribed. A subscribe frame carries many
+        scrips and Kotak answers it as a whole, so sending a speculative
+        spelling would risk taking the other indices batched with it down too.
+        MIDCPNIFTY is the only symbol with more than one candidate, so this
+        costs a guess on one index rather than a working subscription on eight.
+
+        Every candidate is still registered on the inbound side, alongside the
+        master-contract token, because an index packet may identify itself by
+        its name or by a token of Kotak's own choosing, and accepting either
+        costs nothing. Without this the tick arrives and matches no
+        subscription, which looks exactly like no tick at all.
+
+        Several OpenAlgo symbols can share one name (NIFTY and NIFTY50 are both
+        "Nifty 50"), so each name also records every symbol subscribed under
+        it, and a tick is fanned out to all of them.
+
+        register=False only returns the names: the unsubscribe path uses it,
+        and registering there would bring back the mapping it just removed.
+        """
+        candidates = index_name_candidates(symbol)
+        if not register:
+            return candidates[:1]
+        with self._lock:
+            for key in [str(token), *candidates]:
+                mapping_key = (kotak_exchange, key)
+                self._kotak_to_openalgo[mapping_key] = (exchange, symbol)
+                self._symbol_modes.setdefault(mapping_key, set())
+            # Every alias shares one mode set, or a tick arriving under the name
+            # would be published in whichever modes the token happened to hold.
+            modes = self._symbol_modes[(kotak_exchange, str(token))]
+            aliases = self._alias_registry()
+            for key in candidates:
+                self._symbol_modes[(kotak_exchange, key)] = modes
+                aliases.setdefault((kotak_exchange, key), {})[(exchange, symbol)] = str(token)
+        return candidates[:1]
+
+    def _drop_index_alias_target(self, kotak_exchange, exchange, symbol):
+        """Forget one symbol's index aliases once it has no mode left.
+
+        Caller holds self._lock. A name nobody is subscribed under any more
+        loses its mapping too.
+        """
+        aliases = self._alias_registry()
+        for key in index_name_candidates(symbol):
+            alias_key = (kotak_exchange, key)
+            targets = aliases.get(alias_key)
+            if not targets:
+                continue
+            targets.pop((exchange, symbol), None)
+            if not targets:
+                aliases.pop(alias_key, None)
+                self._kotak_to_openalgo.pop(alias_key, None)
+                self._symbol_modes.pop(alias_key, None)
 
     def _enqueue_subscription(self, kotak_exchange, token, sub_type, channelnum="1"):
         """Append a subscription to the queue and arm the batch timer if idle."""
@@ -642,9 +849,7 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     )
                     send(chunk, sub_type=sub_type, channelnum=channelnum)
                 except Exception as e:
-                    logger.error(
-                        f"Batch {verb} failed for sub_type={sub_type}: {e}"
-                    )
+                    logger.error(f"Batch {verb} failed for sub_type={sub_type}: {e}")
 
     def connect(self):
         """Connect to WebSocket - following AliceBlue pattern."""
@@ -709,6 +914,7 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self._symbol_state.clear()
                 self._depth_poll_state.clear()
                 self._kotak_to_openalgo.clear()
+                self._alias_registry().clear()
                 self._symbol_modes.clear()
                 self.subscriptions.clear()
                 self._reconnect_attempts = 0
@@ -742,13 +948,11 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 return
 
             delay = min(
-                self._reconnect_delay * (2 ** self._reconnect_attempts),
+                self._reconnect_delay * (2**self._reconnect_attempts),
                 self._max_reconnect_delay,
             )
 
-            logger.info(
-                f"Reconnecting in {delay}s (attempt {self._reconnect_attempts + 1})"
-            )
+            logger.info(f"Reconnecting in {delay}s (attempt {self._reconnect_attempts + 1})")
 
             # Cancel any existing timer before creating new one
             if self._reconnect_timer:
@@ -808,9 +1012,7 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                             sub_info["exchange"],
                             sub_info["mode"],
                         )
-                        logger.info(
-                            f"Resubscribed to {sub_info['exchange']}:{sub_info['symbol']}"
-                        )
+                        logger.info(f"Resubscribed to {sub_info['exchange']}:{sub_info['symbol']}")
                     except Exception as e:
                         failed_resubs.append(f"{sub_info['exchange']}:{sub_info['symbol']}")
                         logger.error(
@@ -838,9 +1040,7 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
         try:
             auth_string = get_auth_token(self._user_id, bypass_cache=True)
             if not auth_string:
-                logger.error(
-                    f"Cannot recreate client - no auth token for user {self._user_id}"
-                )
+                logger.error(f"Cannot recreate client - no auth token for user {self._user_id}")
                 self._ws_client = None
                 return
 
@@ -892,9 +1092,7 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 try:
                     self._ws_client.close()
                 except Exception as ws_err:
-                    logger.error(
-                        f"Error closing WebSocket client during cleanup: {ws_err}"
-                    )
+                    logger.error(f"Error closing WebSocket client during cleanup: {ws_err}")
                 finally:
                     self._ws_client = None
 
@@ -910,6 +1108,7 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self._symbol_state.clear()
                 self._depth_poll_state.clear()
                 self._kotak_to_openalgo.clear()
+                self._alias_registry().clear()
                 self._symbol_modes.clear()
                 self.subscriptions.clear()
 
@@ -924,9 +1123,7 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
             try:
                 self.cleanup_zmq()
             except Exception as zmq_err:
-                logger.error(
-                    f"Error cleaning up ZMQ during final cleanup attempt: {zmq_err}"
-                )
+                logger.error(f"Error cleaning up ZMQ during final cleanup attempt: {zmq_err}")
 
     def __del__(self):
         """
@@ -966,7 +1163,9 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 success = self.subscribe_depth(exchange, symbol, mode)
                 quote_success = self.subscribe_quote(exchange, symbol, mode)
                 if not quote_success:
-                    logger.warning(f"Depth subscribed but quote (LTP) subscription failed for {exchange}:{symbol}")
+                    logger.warning(
+                        f"Depth subscribed but quote (LTP) subscription failed for {exchange}:{symbol}"
+                    )
             else:
                 logger.error(f"Unknown subscribe mode: {mode}")
                 return self._create_error_response(
@@ -1027,7 +1226,9 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
                 # Clean up caches if no modes remain (mapping_key already removed
                 # by unsubscribe_quote/unsubscribe_depth, or still present but empty)
-                modes_empty = mapping_key not in self._symbol_modes or not self._symbol_modes.get(mapping_key)
+                modes_empty = mapping_key not in self._symbol_modes or not self._symbol_modes.get(
+                    mapping_key
+                )
                 if modes_empty:
                     cache_key = (exchange, symbol)
                     self._ltp_cache.pop(cache_key, None)
@@ -1082,11 +1283,23 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 return False
 
             # Enqueue for batched dispatch — flushed by _process_batch_subscriptions.
-            self._enqueue_subscription(kotak_exchange, token, sub_type="mws")
-            logger.debug(
-                f"Queued quote subscription: {exchange}:{symbol} "
-                f"(kotak: {kotak_exchange}|{token})"
-            )
+            #
+            # An index rides its own feed. Kotak addresses it by name rather
+            # than by master-contract token ("nse_cm|Nifty 50", documented under
+            # Subscribe Index) and answers on message 7207, which only
+            # subscribeIndices delivers. Subscribed as an ordinary scrip it is
+            # accepted and then simply never ticks, which is what left the
+            # option chain's spot reading 0.00 with no price ever arriving.
+            if is_index_exchange(exchange):
+                for feed_name in self._index_feed_names(kotak_exchange, exchange, symbol, token):
+                    self._enqueue_subscription(kotak_exchange, feed_name, sub_type="ifs")
+                logger.debug(f"Queued index subscription: {exchange}:{symbol}")
+            else:
+                self._enqueue_subscription(kotak_exchange, token, sub_type="mws")
+                logger.debug(
+                    f"Queued quote subscription: {exchange}:{symbol} "
+                    f"(kotak: {kotak_exchange}|{token})"
+                )
             return True
 
         except Exception as e:
@@ -1133,12 +1346,33 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                         # Clean up symbol state to prevent unbounded memory growth
                         symbol_key = f"{kotak_exchange}|{token}"
                         self._symbol_state.pop(symbol_key, None)
+                        if is_index_exchange(exchange):
+                            self._drop_index_alias_target(kotak_exchange, exchange, symbol)
                         logger.debug(f"Cleaned up mapping for: {exchange}:{symbol}")
+
+                # Another OpenAlgo symbol may still be subscribed under the
+                # same index name (NIFTY and NIFTY50); the broker feed for that
+                # name stays until the last of them goes.
+                if should_unsub_broker and is_index_exchange(exchange):
+                    aliases = self._alias_registry()
+                    if any(
+                        aliases.get((kotak_exchange, name))
+                        for name in self._index_feed_names(
+                            kotak_exchange, exchange, symbol, token, register=False
+                        )
+                    ):
+                        should_unsub_broker = False
 
             # Enqueue outside lock — batched by _process_batch_subscriptions,
             # so tearing down a large watchlist costs one frame, not one each.
             if should_unsub_broker:
-                self._enqueue_subscription(kotak_exchange, token, sub_type="mwu")
+                if is_index_exchange(exchange):
+                    for feed_name in self._index_feed_names(
+                        kotak_exchange, exchange, symbol, token, register=False
+                    ):
+                        self._enqueue_subscription(kotak_exchange, feed_name, sub_type="ifu")
+                else:
+                    self._enqueue_subscription(kotak_exchange, token, sub_type="mwu")
                 logger.debug(f"Queued broker unsubscribe: {exchange}:{symbol}")
 
         except Exception as e:
@@ -1177,10 +1411,19 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 return False
 
             # Enqueue for batched dispatch — flushed by _process_batch_subscriptions.
+            #
+            # Depth on an index means its price: there is no book to ask for,
+            # and the depth feed answers one with five zero levels. See the
+            # quote path above for why this goes to the index feed instead.
+            if is_index_exchange(exchange):
+                for feed_name in self._index_feed_names(kotak_exchange, exchange, symbol, token):
+                    self._enqueue_subscription(kotak_exchange, feed_name, sub_type="ifs")
+                logger.debug(f"Queued index subscription for depth: {exchange}:{symbol}")
+                return True
+
             self._enqueue_subscription(kotak_exchange, token, sub_type="dps")
             logger.debug(
-                f"Queued depth subscription: {exchange}:{symbol} "
-                f"(kotak: {kotak_exchange}|{token})"
+                f"Queued depth subscription: {exchange}:{symbol} (kotak: {kotak_exchange}|{token})"
             )
             return True
 
@@ -1225,11 +1468,32 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                         # Clean up symbol state to prevent unbounded memory growth
                         symbol_key = f"{kotak_exchange}|{token}"
                         self._symbol_state.pop(symbol_key, None)
+                        if is_index_exchange(exchange):
+                            self._drop_index_alias_target(kotak_exchange, exchange, symbol)
                         logger.debug(f"Cleaned up mapping for: {exchange}:{symbol}")
+
+                # Another OpenAlgo symbol may still be subscribed under the
+                # same index name (NIFTY and NIFTY50); the broker feed for that
+                # name stays until the last of them goes.
+                if should_unsub_broker and is_index_exchange(exchange):
+                    aliases = self._alias_registry()
+                    if any(
+                        aliases.get((kotak_exchange, name))
+                        for name in self._index_feed_names(
+                            kotak_exchange, exchange, symbol, token, register=False
+                        )
+                    ):
+                        should_unsub_broker = False
 
             # Enqueue outside lock — batched by _process_batch_subscriptions.
             if should_unsub_broker:
-                self._enqueue_subscription(kotak_exchange, token, sub_type="dpu")
+                if is_index_exchange(exchange):
+                    for feed_name in self._index_feed_names(
+                        kotak_exchange, exchange, symbol, token, register=False
+                    ):
+                        self._enqueue_subscription(kotak_exchange, feed_name, sub_type="ifu")
+                else:
+                    self._enqueue_subscription(kotak_exchange, token, sub_type="dpu")
                 logger.debug(f"Queued broker depth unsubscribe: {exchange}:{symbol}")
 
         except Exception as e:
@@ -1287,44 +1551,12 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 if exchange not in depth_dict:
                     depth_dict[exchange] = {}
 
-                prev_depth = self._depth_poll_state.get(f"{exchange}|{symbol}", {})
-                prev_buy = prev_depth.get("buyBook", {}) if prev_depth else {}
-                prev_sell = prev_depth.get("sellBook", {}) if prev_depth else {}
+                # The cached book is the last depth packet as sent: a whole
+                # book, so an empty level is empty, not "same as last poll".
+                buy_book = _poll_book(depth_data.get("buy", []))
+                sell_book = _poll_book(depth_data.get("sell", []))
 
-                buy_book = {}
-                for i, level in enumerate(depth_data.get("buy", [])[:5], 1):
-                    # If this level is all zero, use previous value if available
-                    if (
-                        level.get("price", 0) == 0
-                        and level.get("quantity", 0) == 0
-                        and level.get("orders", 0) == 0
-                    ):
-                        prev = prev_buy.get(str(i), {"price": "0", "qty": "0", "orders": "0"})
-                        buy_book[str(i)] = prev
-                    else:
-                        buy_book[str(i)] = {
-                            "price": str(level.get("price", 0)),
-                            "qty": str(level.get("quantity", 0)),
-                            "orders": str(level.get("orders", 0)),
-                        }
-
-                sell_book = {}
-                for i, level in enumerate(depth_data.get("sell", [])[:5], 1):
-                    if (
-                        level.get("price", 0) == 0
-                        and level.get("quantity", 0) == 0
-                        and level.get("orders", 0) == 0
-                    ):
-                        prev = prev_sell.get(str(i), {"price": "0", "qty": "0", "orders": "0"})
-                        sell_book[str(i)] = prev
-                    else:
-                        sell_book[str(i)] = {
-                            "price": str(level.get("price", 0)),
-                            "qty": str(level.get("quantity", 0)),
-                            "orders": str(level.get("orders", 0)),
-                        }
-
-                # Save merged state for next poll
+                # Last polled state, kept for the unsubscribe cleanup
                 self._depth_poll_state[f"{exchange}|{symbol}"] = {
                     "buyBook": buy_book,
                     "sellBook": sell_book,

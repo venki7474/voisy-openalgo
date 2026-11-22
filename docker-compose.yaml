@@ -8,6 +8,7 @@ services:
       - "${FLASK_PORT:-5000}:5000"
       - "${WEBSOCKET_PORT:-8765}:8765"
 
+    # persistent DB, strategies, logs + mount the host .env read+write so dotenv can read it
     volumes:
       # --- BIND MOUNTS (Easily accessible on your VM) ---
       - ./data/db:/app/db                 # Database files
@@ -15,7 +16,16 @@ services:
       - ./data/log:/app/log               # App logic logs
       - ./strategies:/app/strategies      # YOUR PYTHON CODE (Edit these here!)
       - ./data/keys:/app/keys             # API Keys
-      - ./.env:/app/.env:ro               # Read-only env file
+      #- ./.env:/app/.env:ro           # Temporary directory for numba/scipy (named volume)
+      # Long form with create_host_path off on purpose: when .env is missing
+      # on the host, Docker stops with "bind source path does not exist"
+      # instead of creating a folder named .env. ./docker-build.sh creates
+      # .env for you.
+      - type: bind
+        source: ./.env
+        target: /app/.env
+        bind:
+          create_host_path: false
 
     environment:
       - FLASK_ENV=${FLASK_ENV:-production}

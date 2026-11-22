@@ -31,6 +31,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { authApi } from '@/api/auth'
 import { LogoutConfirmDialog } from '@/components/auth/LogoutConfirmDialog'
+import { useSocketContext } from '@/components/socket/SocketProvider'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -83,7 +84,6 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { useProfileMenuItems } from '@/hooks/useProfileMenuItems'
-import { useSocket } from '@/hooks/useSocket'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/authStore'
 import { useThemeStore } from '@/stores/themeStore'
@@ -95,6 +95,20 @@ interface SearchResult {
   name: string
   exchange: string
   token: string
+}
+
+/** A symbol the bulk add could not add, with the server's reason. */
+interface BulkAddFailure {
+  symbol: string
+  exchange: string
+  error: string
+}
+
+/** A symbol the server added under its master contract spelling (M_M as M&M). */
+interface BulkAddRename {
+  from: string
+  to: string
+  exchange: string
 }
 
 interface WatchlistItem {
@@ -350,6 +364,7 @@ export default function Historify() {
   // Dialog states
   const [bulkAddDialogOpen, setBulkAddDialogOpen] = useState(false)
   const [bulkAddText, setBulkAddText] = useState('')
+  const [bulkAddFailures, setBulkAddFailures] = useState<BulkAddFailure[]>([])
   const [isBulkAdding, setIsBulkAdding] = useState(false)
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false)
   const [uploadSymbol, setUploadSymbol] = useState('')
@@ -387,8 +402,11 @@ export default function Historify() {
   // Catalog filtering
   const [catalogFilter, setCatalogFilter] = useState({ exchange: '', interval: '', search: '' })
 
-  // Socket.IO for real-time progress
-  const { socket } = useSocket()
+  // Socket.IO for real-time progress, on the app-wide connection SocketProvider
+  // owns. Calling useSocket() here opened a second connection for this page
+  // and registered every global alert handler a second time, so each order
+  // toast and sound played twice while this page was open.
+  const { socket } = useSocketContext()
 
   // Computed values (allIntervals not needed for now since we use storage_intervals)
   // const allIntervals = intervals
@@ -1003,6 +1021,7 @@ export default function Historify() {
     }
 
     setIsBulkAdding(true)
+    setBulkAddFailures([])
     try {
       const csrfToken = await fetchCSRFToken()
       const response = await fetch('/historify/api/watchlist/bulk', {
@@ -1013,11 +1032,33 @@ export default function Historify() {
       })
       const data = await response.json()
       if (data.status === 'success') {
-        showToast.success(`Added ${data.added} symbols`, 'historify')
-        setBulkAddDialogOpen(false)
-        setBulkAddText('')
-        loadWatchlist()
-        loadStats()
+        const failed: BulkAddFailure[] = data.failed ?? []
+        const renamed: BulkAddRename[] = data.renamed ?? []
+
+        let summary = `Added ${data.added} symbol${data.added === 1 ? '' : 's'}`
+        if (data.skipped > 0) summary += `, ${data.skipped} already in watchlist`
+        const renamedNote =
+          renamed.length > 0
+            ? `Added as: ${renamed.map((r) => `${r.from} as ${r.to}`).join(', ')}`
+            : undefined
+
+        if (failed.length === 0) {
+          showToast.success(summary, 'historify', { description: renamedNote })
+          setBulkAddDialogOpen(false)
+          setBulkAddText('')
+        } else {
+          // Keep the dialog open with only the symbols that were not added,
+          // so they can be corrected and sent again.
+          showToast.warning(`${summary}. ${failed.length} not added.`, 'historify', {
+            description: renamedNote,
+          })
+          setBulkAddFailures(failed)
+          setBulkAddText(failed.map((f) => `${f.symbol},${f.exchange}`).join('\n'))
+        }
+        if (data.added > 0) {
+          loadWatchlist()
+          loadStats()
+        }
       } else {
         showToast.error(data.message || 'Failed to bulk add symbols', 'historify')
       }
@@ -2983,7 +3024,13 @@ export default function Historify() {
       </Dialog>
 
       {/* Bulk Add Dialog */}
-      <Dialog open={bulkAddDialogOpen} onOpenChange={setBulkAddDialogOpen}>
+      <Dialog
+        open={bulkAddDialogOpen}
+        onOpenChange={(open) => {
+          setBulkAddDialogOpen(open)
+          if (!open) setBulkAddFailures([])
+        }}
+      >
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>Bulk Add Symbols</DialogTitle>
@@ -2993,14 +3040,39 @@ export default function Historify() {
           </DialogHeader>
           <Textarea
             placeholder="RELIANCE,NSE
-INFY,NSE
+M&M,NSE
+BAJAJ-AUTO,NSE
 NIFTY24DEC25000CE,NFO"
             value={bulkAddText}
             onChange={(e) => setBulkAddText(e.target.value)}
             rows={8}
           />
+          {bulkAddFailures.length > 0 && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm">
+              <p className="font-medium text-destructive">
+                {bulkAddFailures.length} symbol{bulkAddFailures.length === 1 ? ' was' : 's were'}{' '}
+                not added. Correct them above and add again.
+              </p>
+              <ul className="mt-2 max-h-32 space-y-1 overflow-y-auto text-muted-foreground">
+                {bulkAddFailures.map((f) => (
+                  <li key={`${f.symbol}:${f.exchange}`}>
+                    <span className="font-mono text-foreground">
+                      {f.symbol},{f.exchange}
+                    </span>
+                    : {f.error}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           <DialogFooter>
-            <Button variant="outline" onClick={() => setBulkAddDialogOpen(false)}>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setBulkAddDialogOpen(false)
+                setBulkAddFailures([])
+              }}
+            >
               Cancel
             </Button>
             <Button onClick={handleBulkAdd} disabled={isBulkAdding}>

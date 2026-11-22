@@ -87,7 +87,43 @@ def copy_from_dataframe(df):
         db_session.rollback()
 
 
+def replace_symtoken_table(frames):
+    """Swap the master contract in one transaction.
+
+    ``frames`` is a list of (segment, DataFrame). A row whose token was already
+    taken by an earlier segment is dropped, matching what the old per-segment
+    copy_from_dataframe calls produced. The delete and the insert commit
+    together, so any failure rolls back to the previous contract instead of
+    leaving the table empty or half-filled.
+    """
+    records = []
+    seen_tokens = set()
+    for _segment, df in frames:
+        rows = [row for row in df.to_dict(orient="records") if str(row["token"]) not in seen_tokens]
+        seen_tokens.update(str(row["token"]) for row in rows)
+        records.extend(rows)
+
+    try:
+        SymToken.query.delete()
+        db_session.bulk_insert_mappings(SymToken, records)
+        db_session.commit()
+        logger.info(f"Replaced symtoken table with {len(records)} records")
+    except Exception:
+        db_session.rollback()
+        raise
+
+
+# Segment files master_contract_download() loads into symtoken. NSE_COM is
+# also listed by the scripmaster API but nothing reads it, so it is skipped.
+REQUIRED_SEGMENTS = ("NSE_CM", "NSE_FO", "BSE_CM", "CDE_FO", "MCX_FO", "BSE_FO")
+
+
 def download_csv_kotak_data(output_path):
+    """Download every segment file, or raise.
+
+    Each file is needed: a refresh that went ahead with one segment missing
+    replaced the table without it, silently dropping that segment's symbols.
+    """
     logger.info("Downloading Master Contract CSV Files")
 
     # URLs of the CSV files to be downloaded
@@ -103,15 +139,21 @@ def download_csv_kotak_data(output_path):
 
     # Create a list to hold the paths of the downloaded files
     downloaded_files = []
+    failed = []
 
-    # Iterate through the URLs and download the CSV files
-    for key, url in csv_urls.items():
+    # Iterate through the segments and download the CSV files
+    for key in REQUIRED_SEGMENTS:
+        url = csv_urls.get(key)
+        if not url:
+            logger.error(f"Scripmaster did not list a file for {key}")
+            failed.append(key)
+            continue
         try:
             logger.info(f"Downloading {key} from {url}")
             # Send GET request using httpx
             response = client.get(url, timeout=30)
             # Check if the request was successful
-            if response.status_code == 200:
+            if response.status_code == 200 and response.content.strip():
                 # Construct the full output path for the file
                 file_path = f"{output_path}/{key}.csv"
                 # Write the content to the file
@@ -121,15 +163,22 @@ def download_csv_kotak_data(output_path):
                 logger.info(f"Successfully downloaded {key} ({len(response.content)} bytes)")
             else:
                 logger.error(
-                    f"Failed to download {key} from {url}. Status code: {response.status_code}"
+                    f"Failed to download {key} from {url}. Status code: {response.status_code}, "
+                    f"bytes: {len(response.content)}"
                 )
+                failed.append(key)
         except httpx.HTTPError as e:
             logger.error(f"HTTP error downloading {key}: {e}")
+            failed.append(key)
         except Exception as e:
             logger.error(f"Error downloading {key}: {e}")
+            failed.append(key)
 
-    if not downloaded_files:
-        raise Exception("No master contract files were downloaded successfully")
+    if failed:
+        raise Exception(
+            f"Could not download the Kotak symbol files for {', '.join(failed)}. "
+            "Your existing symbols were kept; try the download again."
+        )
 
     logger.info(f"Downloaded {len(downloaded_files)} files successfully")
     return downloaded_files
@@ -160,7 +209,12 @@ def process_kotak_nse_csv(path):
     df.loc[df["pGroup"].isin(["EQ", "BE"]), "instrumenttype"] = "EQ"
     df.loc[df["pISIN"].isna(), "exchange"] = "NSE_INDEX"
     df.loc[df["pGroup"].isin(["EQ", "BE"]), "exchange"] = "NSE"
-    df.loc[df["pISIN"].isna(), "instrumenttype"] = "INDEX"
+    # An index carries no ISIN, which is how it is told apart here. It is typed
+    # EQ, not INDEX: instrumenttype is the platform's own four-value vocabulary
+    # -- EQ, FUT, CE, PE -- taken from Kite, which likewise types its INDICES
+    # segment EQ. The exchange column (NSE_INDEX) is what says this is an index,
+    # so an INDEX type here would be a fifth value no consumer knows (QA MC-04).
+    df.loc[df["pISIN"].isna(), "instrumenttype"] = "EQ"
     df.loc[df["pISIN"].isna(), "pGroup"] = ""
 
     filtereddataframe["instrumenttype"] = df["instrumenttype"]
@@ -210,7 +264,8 @@ def process_kotak_bse_csv(path):
 
     df["exchange"] = "BSE"
     df.loc[df["pISIN"].isna(), "exchange"] = "BSE_INDEX"
-    df.loc[df["pISIN"].isna(), "instrumenttype"] = "INDEX"
+    # EQ rather than INDEX, for the reason given in the NSE branch above.
+    df.loc[df["pISIN"].isna(), "instrumenttype"] = "EQ"
     df.loc[df["pISIN"].isna(), "pGroup"] = ""
 
     filtereddataframe["instrumenttype"] = df["instrumenttype"]
@@ -229,6 +284,35 @@ def process_kotak_bse_csv(path):
     token_df = df_filtered.drop(columns=columns_to_remove)
 
     return token_df
+
+
+def _demote_non_expiring(tokensymbols, raw_expiry):
+    """Strip the expiry, and the derivative type, from rows that never expire.
+
+    Kotak marks a row that carries no expiry with a non-positive lExpiryDate,
+    and the segments do not agree on which one: MCX uses 0 and CDS uses -1.
+    Converted as a timestamp those became dates, so the table advertised 40 MCX
+    rows expiring 01-JAN-70 and 14 CDS rows expiring 31-DEC-79, and
+    combine_details baked each date into the symbol: GOLD01JAN70,
+    EURINR31DEC79FUT (QA MC-05).
+
+    The type goes with the expiry. Both sets are reference rows rather than
+    contracts -- the MCX spot and index rows whose brsymbol ends COM, and the
+    CDS currency pairs USDINR, EURINR, JPYINR and a DUMMY1 test row -- but
+    pOptionType reads XX on the CDS ones, which the XX-to-FUT rewrite turns
+    into a future. Emptying only the expiry would leave a future with no expiry
+    date, which is a worse row than the one it replaced and fails MC-05 from
+    the other side. A thing with no expiry is not a future.
+
+    Read from the raw column, before the NFO and CDS branches add their
+    315513000 epoch offset, so one rule recognises the sentinel in every
+    segment rather than a different rendered date in each.
+    """
+    no_expiry = pd.to_numeric(raw_expiry, errors="coerce").fillna(0) <= 0
+    if no_expiry.any():
+        tokensymbols.loc[no_expiry, "expiry"] = ""
+        tokensymbols.loc[no_expiry, "instrumenttype"] = ""
+    return tokensymbols
 
 
 def combine_details(row):
@@ -255,6 +339,7 @@ def process_kotak_nfo_csv(path):
     tokensymbols = pd.DataFrame()
     tokensymbols["token"] = df["pSymbol"]
     tokensymbols["name"] = df["pSymbolName"]
+    raw_expiry = df["lExpiryDate"].copy()
     df["lExpiryDate"] = df["lExpiryDate"] + 315513000
 
     # Convert 'Expiry date' from Unix timestamp to datetime
@@ -273,7 +358,9 @@ def process_kotak_nfo_csv(path):
     tokensymbols["exchange"] = "NFO"
 
     # df1['instrumenttype'] = df['pOptionType'].apply(lambda x: x.replace('XX', 'FUT'))
-    tokensymbols["instrumenttype"] = df["pOptionType"].str.replace("XX", "FUT")
+    tokensymbols["instrumenttype"] = df["pOptionType"].str.replace("XX", "FUT").str.strip()
+
+    _demote_non_expiring(tokensymbols, raw_expiry)
 
     # pSymbolName  df['expiry']
     tokensymbols["symbol"] = tokensymbols.apply(combine_details, axis=1)
@@ -434,6 +521,10 @@ def get_kotak_master_filepaths():
     return {}
 
 
+# Scale of every price in the cde_fo file; see process_kotak_cds_csv.
+CDS_PRICE_DIVISOR = 10_000_000
+
+
 def process_kotak_cds_csv(path):
     """
     Processes the kotak CSV file to fit the existing database schema and performs exchange name mapping.
@@ -447,6 +538,7 @@ def process_kotak_cds_csv(path):
     tokensymbols = pd.DataFrame()
     tokensymbols["token"] = df["pSymbol"]
     tokensymbols["name"] = df["pSymbolName"]
+    raw_expiry = df["lExpiryDate"].copy()
     df["lExpiryDate"] = df["lExpiryDate"] + 315513000
 
     # Convert 'Expiry date' from Unix timestamp to datetime
@@ -455,17 +547,27 @@ def process_kotak_cds_csv(path):
     # Format the datetime object to the desired format '15-APR-24'
     tokensymbols["expiry"] = tokensymbols["expiry"].dt.strftime("%d-%b-%y").str.upper()
 
-    tokensymbols["strike"] = df["dStrikePrice"] / 100
+    # cde_fo prices are in units of 10^-7 rupees (lPrecision 4 x lMultiplier
+    # 1000), not paise like the other segments: USDINR26DEC101.75PE carries
+    # dStrikePrice 1017500000 and USDINR's 0.0025 tick is dTickSize 25000.
+    # Dividing by 100 stored strike 10175000 and built symbols from it.
+    # Futures carry the placeholder -1; keep it at -0.01 like the other
+    # Kotak segments rather than scaling it to -1e-07.
+    tokensymbols["strike"] = (df["dStrikePrice"] / CDS_PRICE_DIVISOR).where(
+        df["dStrikePrice"] > 0, df["dStrikePrice"] / 100
+    )
     tokensymbols["strike"] = tokensymbols["strike"].apply(lambda x: int(x) if x.is_integer() else x)
 
     tokensymbols["lotsize"] = df["lLotSize"]
-    tokensymbols["tick_size"] = pd.to_numeric(df["dTickSize"], errors="coerce") / 100
+    tokensymbols["tick_size"] = pd.to_numeric(df["dTickSize"], errors="coerce") / CDS_PRICE_DIVISOR
     tokensymbols["brsymbol"] = df["pTrdSymbol"]
     tokensymbols["brexchange"] = df["pExchSeg"]
     tokensymbols["exchange"] = "CDS"
 
     # df1['instrumenttype'] = df['pOptionType'].apply(lambda x: x.replace('XX', 'FUT'))
-    tokensymbols["instrumenttype"] = df["pOptionType"].str.replace("XX", "FUT")
+    tokensymbols["instrumenttype"] = df["pOptionType"].str.replace("XX", "FUT").str.strip()
+
+    _demote_non_expiring(tokensymbols, raw_expiry)
 
     # pSymbolName  df['expiry']
     tokensymbols["symbol"] = tokensymbols.apply(combine_details, axis=1)
@@ -486,7 +588,7 @@ def process_kotak_mcx_csv(path):
     tokensymbols = pd.DataFrame()
     tokensymbols["token"] = df["pSymbol"]
     tokensymbols["name"] = df["pSymbolName"]
-    df["lExpiryDate"] = df["lExpiryDate"]
+    raw_expiry = df["lExpiryDate"].copy()
 
     # Convert 'Expiry date' from Unix timestamp to datetime
     tokensymbols["expiry"] = pd.to_datetime(df["lExpiryDate"], unit="s")
@@ -504,7 +606,14 @@ def process_kotak_mcx_csv(path):
     tokensymbols["exchange"] = "MCX"
 
     # df1['instrumenttype'] = df['pOptionType'].apply(lambda x: x.replace('XX', 'FUT'))
-    tokensymbols["instrumenttype"] = df["pOptionType"].str.replace("XX", "FUT")
+    # Stripped because Kotak pads pOptionType out to two characters and leaves it
+    # blank on the rows that are neither a future nor an option: the MCX spot and
+    # index rows (GOLDCOM, MCXCOPRDEX and the like, all carrying epoch-zero
+    # expiries). Untrimmed, that "  " lands in the table as a fifth instrument
+    # type nothing recognises, where "" already means unclassified (QA MC-04).
+    tokensymbols["instrumenttype"] = df["pOptionType"].str.replace("XX", "FUT").str.strip()
+
+    _demote_non_expiring(tokensymbols, raw_expiry)
 
     # pSymbolName  df['expiry']
     tokensymbols["symbol"] = tokensymbols.apply(combine_details, axis=1)
@@ -525,7 +634,7 @@ def process_kotak_bfo_csv(path):
     tokensymbols = pd.DataFrame()
     tokensymbols["token"] = df["pSymbol"]
     tokensymbols["name"] = df["pSymbolName"]
-    df["lExpiryDate"] = df["lExpiryDate"]
+    raw_expiry = df["lExpiryDate"].copy()
 
     # Convert 'Expiry date' from Unix timestamp to datetime
     tokensymbols["expiry"] = pd.to_datetime(df["lExpiryDate"], unit="s")
@@ -543,7 +652,9 @@ def process_kotak_bfo_csv(path):
     tokensymbols["exchange"] = "BFO"
 
     # df1['instrumenttype'] = df['pOptionType'].apply(lambda x: x.replace('XX', 'FUT'))
-    tokensymbols["instrumenttype"] = df["pOptionType"].str.replace("XX", "FUT")
+    tokensymbols["instrumenttype"] = df["pOptionType"].str.replace("XX", "FUT").str.strip()
+
+    _demote_non_expiring(tokensymbols, raw_expiry)
 
     # pSymbolName  df['expiry']
     tokensymbols["symbol"] = tokensymbols.apply(combine_details, axis=1)
@@ -566,62 +677,58 @@ def master_contract_download():
 
     output_path = "tmp"
     try:
-        # Download CSV files
-        downloaded_files = download_csv_kotak_data(output_path)
+        # Download and process every segment before touching the stored
+        # contract. A failure anywhere up to the swap leaves it unchanged.
+        download_csv_kotak_data(output_path)
 
-        if not downloaded_files:
-            raise Exception("No CSV files were downloaded successfully")
-
-        # Clear existing data
-        delete_symtoken_table()
-
-        # Process each exchange if the file exists
         processors = [
-            ("NSE_CM.csv", process_kotak_nse_csv, "NSE Cash"),
-            ("NSE_FO.csv", process_kotak_nfo_csv, "NSE F&O"),
-            ("BSE_CM.csv", process_kotak_bse_csv, "BSE Cash"),
-            ("CDE_FO.csv", process_kotak_cds_csv, "CDS"),
-            ("MCX_FO.csv", process_kotak_mcx_csv, "MCX"),
-            ("BSE_FO.csv", process_kotak_bfo_csv, "BSE F&O"),
+            (process_kotak_nse_csv, "NSE Cash"),
+            (process_kotak_nfo_csv, "NSE F&O"),
+            (process_kotak_bse_csv, "BSE Cash"),
+            (process_kotak_cds_csv, "CDS"),
+            (process_kotak_mcx_csv, "MCX"),
+            (process_kotak_bfo_csv, "BSE F&O"),
         ]
 
-        total_records = 0
-        for filename, processor_func, exchange_name in processors:
-            file_path = f"{output_path}/{filename}"
-            if os.path.exists(file_path):
-                try:
-                    logger.info(f"Processing {exchange_name} data...")
-                    token_df = processor_func(output_path)
-                    if not token_df.empty:
-                        copy_from_dataframe(token_df)
-                        total_records += len(token_df)
-                        logger.info(f"Processed {len(token_df)} records for {exchange_name}")
-                    else:
-                        logger.warning(f"No data found in {exchange_name} file")
-                except Exception as e:
-                    logger.error(f"Error processing {exchange_name}: {e}")
-            else:
-                logger.warning(f"File not found: {filename}")
+        frames = []
+        for processor_func, exchange_name in processors:
+            logger.info(f"Processing {exchange_name} data...")
+            try:
+                token_df = processor_func(output_path)
+            except Exception as e:
+                raise Exception(
+                    f"Could not read the Kotak {exchange_name} symbol file ({e}). "
+                    "Your existing symbols were kept; try the download again."
+                ) from e
+            if token_df is None or token_df.empty:
+                raise Exception(
+                    f"The Kotak {exchange_name} symbol file had no usable rows. "
+                    "Your existing symbols were kept; try the download again."
+                )
+            logger.info(f"Processed {len(token_df)} records for {exchange_name}")
+            frames.append((exchange_name, token_df))
+
+        replace_symtoken_table(frames)
 
         # Clean up temporary files
         delete_kotak_temp_data(output_path)
 
+        total_records = sum(len(df) for _name, df in frames)
         logger.info(f"Master contract download completed. Total records: {total_records}")
-
-        if total_records > 0:
-            return socketio.emit(
-                "master_contract_download",
-                {
-                    "status": "success",
-                    "message": f"Successfully Downloaded {total_records} records",
-                },
-            )
-        else:
-            raise Exception("No records were processed successfully")
+        return socketio.emit(
+            "master_contract_download",
+            {
+                "status": "success",
+                "message": f"Successfully Downloaded {total_records} records",
+            },
+        )
 
     except Exception as e:
         logger.error(f"Master contract download failed: {str(e)}")
-        return socketio.emit("master_contract_download", {"status": "error", "message": str(e)})
+        socketio.emit("master_contract_download", {"status": "error", "message": str(e)})
+        # Raise so the shared caller (utils/auth_utils) records the download as
+        # failed; it ignores the return value and reports success otherwise.
+        raise
 
 
 def search_symbols(symbol, exchange):

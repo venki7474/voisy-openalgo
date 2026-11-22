@@ -4,6 +4,7 @@ import gzip
 import io
 import json
 import os
+import re
 import shutil
 
 import numpy as np
@@ -12,6 +13,7 @@ from sqlalchemy import Column, Float, Index, Integer, Sequence, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 
+from broker.zerodha.mapping.mcx_contract_size import get_contract_size
 from database.auth_db import get_auth_token
 from database.engine_factory import create_db_engine
 from extensions import socketio  # Import SocketIO
@@ -154,6 +156,45 @@ def reformat_symbol(row):
     return symbol
 
 
+# NSE series in which a company's own units trade outside EQ. Kite keeps the
+# series on the tradingsymbol of these (HFCL-BE, EMBASSY-RR, GOLDSTAR-ST),
+# while OpenAlgo's equity symbol is the bare exchange symbol, as NSE lists it
+# (Symbol HFCL, Series BE). The Sahi plugin strips every non-EQ series the
+# same way, and the Noren plugins strip -BE. brsymbol
+# keeps Kite's tradingsymbol unchanged: every order, quote, history and margin
+# call sends get_br_symbol(), and every book maps back with get_oa_symbol().
+# Not stripped: the debt and government security series (SG, GS, TB, N0 and
+# the like), and -RL, whose bare names exist as rows of their own.
+_NSE_SERIES_SUFFIXES = ('BE', 'BZ', 'RR', 'IV', 'SM', 'ST')
+_NSE_SERIES_RE = re.compile(r'^(.+)-(?:' + '|'.join(_NSE_SERIES_SUFFIXES) + r')$')
+
+
+def strip_nse_series_suffix(df):
+    """Give NSE cash rows traded outside the EQ series their bare symbol.
+
+    Only the OpenAlgo ``symbol`` changes; ``brsymbol`` stays Kite's
+    tradingsymbol. A row keeps its suffix when the bare name is already
+    another row's symbol, or when two suffixed rows would claim the same bare
+    name, so no two NSE rows ever share a symbol.
+    """
+    is_cash = (df['exchange'] == 'NSE') & (df['instrumenttype'] == 'EQ')
+    bases = df.loc[is_cash, 'symbol'].astype(str).str.extract(_NSE_SERIES_RE)[0]
+    suffixed = bases.notna()
+    if not suffixed.any():
+        return df
+
+    taken = set(df.loc[is_cash, 'symbol'])
+    claims = bases[suffixed].value_counts()
+    strip = suffixed & bases.map(lambda b: isinstance(b, str) and b not in taken and claims[b] == 1)
+
+    df.loc[strip[strip].index, 'symbol'] = bases[strip]
+    kept = int(suffixed.sum() - strip.sum())
+    logger.info(
+        f"NSE series suffix removed from {int(strip.sum())} symbols"
+        + (f", kept on {kept} whose bare name is already in use" if kept else "")
+    )
+    return df
+
 
 def process_zerodha_csv(path):
     """
@@ -215,8 +256,64 @@ def process_zerodha_csv(path):
 
     df['brsymbol'] = df['symbol']
     df['symbol'] = df.apply(reformat_symbol, axis=1)
+    df = strip_nse_series_suffix(df)
     df['brexchange'] = df['_kite_exchange']
     df = df.drop(columns=['_kite_exchange'])
+
+    # Kite reports lot_size = 1 for every MCX instrument because it denominates
+    # MCX order quantity in contracts rather than units. Every other Indian
+    # broker ships the real market lot, so keeping Kite's 1 here would mean the
+    # same one-lot crude order is quantity 100 on Angel and 1 on Zerodha.
+    #
+    # OpenAlgo's API is one request body for any broker, so the real lot goes
+    # here and broker/zerodha converts back to contracts at the Kite boundary,
+    # the same way it already translates symbol, product and price type.
+    # See mapping/mcx_contract_size.py for both halves.
+    is_mcx = df['exchange'] == 'MCX'
+    if is_mcx.any():
+        # Sized per row, not per root. MCX revises contract sizes, and the old
+        # and new sizes trade side by side until the last pre-revision contract
+        # expires -- MCXBULLDEX is 30 for Sep/Oct 2026 and 15 from Nov 2026.
+        # Only the expiry on the row can tell those apart.
+        #
+        # `expiry` is already formatted to '%d-%b-%y' by this point; coerce
+        # parses it back and leaves blanks (all the non-derivative rows) as NaT,
+        # which resolves to the unrevised size.
+        expiries = pd.to_datetime(
+            df.loc[is_mcx, 'expiry'], format='%d-%b-%y', errors='coerce'
+        )
+        sizes = pd.Series(
+            [
+                # A blank name is 'unknown underlying', not an input worth a
+                # lookup -- Kite ships thousands of them on other segments.
+                None if pd.isna(name) else get_contract_size(
+                    name, None if pd.isna(exp) else exp.date()
+                )
+                for name, exp in zip(df.loc[is_mcx, 'name'], expiries, strict=True)
+            ],
+            index=df.index[is_mcx],
+            dtype='float64',
+        )
+        # An unmapped underlying keeps Kite's 1, which is what shipped before
+        # this table existed: orders still size correctly in contracts, they
+        # just do not read like the other brokers. A wrong lot is far worse
+        # than an inconsistent one, so it is never guessed -- it is logged.
+        df.loc[is_mcx, 'lotsize'] = sizes.fillna(df.loc[is_mcx, 'lotsize']).astype('int64')
+        unmapped = sorted(df.loc[is_mcx, 'name'][sizes.isna()].dropna().unique())
+        logger.info(
+            f"MCX lot sizes applied to {int(sizes.notna().sum())} of {int(is_mcx.sum())} rows"
+        )
+        if unmapped:
+            logger.warning(f"No MCX contract size for: {', '.join(unmapped)}")
+
+    # Kite leaves `name` blank on ~8k EQ-type rows: BSE/NSE debt (NCDs, bonds,
+    # CPs, the -N0/-SF series) and the NCO spot underlyings GOLD, SILVER,
+    # XAUGOLD, COPPER. Every derivative carries its underlying, so only these
+    # are affected. Fall back to the tradingsymbol, which for the NCO rows is
+    # the underlying itself. Done after the MCX sizing above, which reads a
+    # blank name as 'unknown underlying'.
+    blank_name = df['name'].isna() | (df['name'].astype(str).str.strip() == '')
+    df.loc[blank_name, 'name'] = df.loc[blank_name, 'brsymbol']
 
     # Fill NaN values in the 'expiry' column with an empty string
     df['expiry'] = df['expiry'].fillna('')

@@ -8,7 +8,9 @@ import httpx
 
 from broker.ibulls.baseurl import INTERACTIVE_URL
 from broker.ibulls.mapping.transform_data import (
+    OrderFieldError,
     map_product_type,
+    protected_order_type,
     reverse_map_product_type,
     transform_data,
     transform_modify_order_data,
@@ -17,8 +19,33 @@ from database.auth_db import get_auth_token
 from database.token_db import get_br_symbol, get_symbol, get_token
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
+from utils.position_read import (
+    PositionReadError,
+    read_position_book,
+    refuse_smart_order_on_read_failure,
+)
+from utils.smart_order_guard import PositionBookCache, SymbolLocks
 
 logger = get_logger(__name__)
+
+# XTS exchange segment -> OpenAlgo exchange, for orders built from a position.
+_SEGMENT_EXCHANGE = {
+    "NSECM": "NSE",
+    "BSECM": "BSE",
+    "NSEFO": "NFO",
+    "BSEFO": "BFO",
+    "MCXFO": "MCX",
+    "NSECD": "CDS",
+}
+
+
+class _OrderResponse:
+    """Response-shaped result for an order refused before it is sent; the
+    services read ``.status``."""
+
+    def __init__(self, status):
+        self.status = status
+        self.status_code = status
 
 
 def get_api_response(endpoint, auth, method="GET", payload=""):
@@ -36,7 +63,7 @@ def get_api_response(endpoint, auth, method="GET", payload=""):
     url = f"{INTERACTIVE_URL}{endpoint}"
 
     logger.debug(f"Request URL: {url}")
-    logger.debug(f"Headers: {headers}")
+    logger.debug(f"Header names: {list(headers)}")
     logger.debug(f"Payload: {json.dumps(payload, indent=2) if payload else 'None'}")
 
     if method == "GET":
@@ -72,46 +99,46 @@ def get_holdings(auth):
 # --- Per-Symbol Smart Order Lock ---
 # Ensures only one smart order per symbol executes at a time.
 # Others queue and execute sequentially, each getting a fresh position book.
-_symbol_locks = {}          # {symbol_key: threading.Lock}
-_symbol_locks_lock = threading.Lock()
+# The registry only holds the symbols in use right now, and under the gthread
+# worker a smart order gives up after SMART_ORDER_LOCK_WAIT_SECONDS rather
+# than hold a request thread behind a slow broker. Under eventlet and the dev
+# server it waits as long as it takes, as before.
+_symbol_locks = SymbolLocks(name="ibulls smart orders")
 
 # --- Position Book Cache ---
 # Caches get_positions() for 1 second. Invalidated after each smart order placement.
-_position_cache = {}        # {auth_token: {"data": ..., "timestamp": ...}}
-_position_cache_lock = threading.Lock()
-_POSITION_CACHE_TTL = 1.0   # seconds
+# A fetch still in flight when an order invalidates the book is returned to
+# its own caller but never cached, so the next order cannot size itself
+# against the position from before that fill.
+_position_cache = PositionBookCache()
 
 
 def _get_symbol_lock(symbol, exchange, product):
-    """Get or create a per-symbol lock for serializing smart orders."""
-    key = f"{symbol}:{exchange}:{product}"
-    with _symbol_locks_lock:
-        if key not in _symbol_locks:
-            _symbol_locks[key] = threading.Lock()
-        return _symbol_locks[key]
+    """Hold the per-symbol smart-order lock for the body of a ``with`` block.
+
+    Yields True while held, or False when the bounded wait under the gthread
+    worker ran out; the caller then returns ``SymbolLocks.busy(symbol)`` and
+    places nothing.
+    """
+    return _symbol_locks.hold(symbol, exchange, product)
+
+
+def _position_book_ok(positions_data):
+    """XTS marks a position read that worked with type "success"; a failure says "error"."""
+    return isinstance(positions_data, dict) and positions_data.get("type") == "success"
 
 
 def _get_cached_positions(auth):
     """Get positions from cache if fresh, otherwise fetch from broker API."""
-    with _position_cache_lock:
-        now = time.monotonic()
-        cached = _position_cache.get(auth)
-        if cached and (now - cached["timestamp"]) < _POSITION_CACHE_TTL:
-            return cached["data"]
-
-    # Cache miss or expired - fetch from broker
-    positions_data = get_positions(auth)
-
-    with _position_cache_lock:
-        _position_cache[auth] = {"data": positions_data, "timestamp": time.monotonic()}
-
-    return positions_data
+    return _position_cache.get(
+        auth,
+        lambda: read_position_book("ibulls", lambda: get_positions(auth), _position_book_ok),
+    )
 
 
 def _invalidate_position_cache(auth):
     """Invalidate the position cache so the next queued order fetches fresh data."""
-    with _position_cache_lock:
-        _position_cache.pop(auth, None)
+    _position_cache.invalidate(auth)
 
 
 
@@ -176,8 +203,12 @@ def place_order_api(data, auth):
     else:
         # Traditional symbol-based payload that needs transformation
         token = get_token(data["symbol"], data["exchange"])
-        logger.debug(f"token: {token}")
-        newdata = transform_data(data, token)
+        logger.debug("Order API token available")
+        try:
+            newdata = transform_data(data, token, auth)
+        except OrderFieldError as e:
+            logger.info(f"Order not sent to Ibulls: {e}")
+            return _OrderResponse(400), {"status": "error", "message": str(e)}, None
 
     headers = {
         "authorization": AUTH_TOKEN,
@@ -214,6 +245,7 @@ def place_order_api(data, auth):
     return response, response_data, orderid
 
 
+@refuse_smart_order_on_read_failure
 def place_smartorder_api(data: dict, auth: str) -> tuple:
     """
     Place a smart order to achieve target position size based on the OpenAlgo specification.
@@ -259,9 +291,13 @@ def place_smartorder_api(data: dict, auth: str) -> tuple:
 
         # Per-symbol lock: serialize smart orders per symbol
         symbol_lock = _get_symbol_lock(symbol, exchange, product)
-        with symbol_lock:
+        with symbol_lock as acquired:
+            if not acquired:
+                return SymbolLocks.busy(symbol)
             return _place_smartorder_locked_ibulls(data, AUTH_TOKEN, symbol, exchange, product, action)
 
+    except PositionReadError:
+        raise
     except Exception as e:
         error_msg = f"Error in place_smartorder_api: {str(e)}"
         logger.exception(error_msg)
@@ -294,6 +330,8 @@ def _place_smartorder_locked_ibulls(data, AUTH_TOKEN, symbol, exchange, product,
             logger.debug(f"Target Position Size: {position_size}")
             logger.debug("=== END ANALYSIS ===")
 
+        except PositionReadError:
+            raise
         except Exception as e:
             error_msg = f"Failed to fetch current position for {symbol}"
             logger.error(f"{error_msg}. Error: {str(e)}")
@@ -372,6 +410,8 @@ def _place_smartorder_locked_ibulls(data, AUTH_TOKEN, symbol, exchange, product,
         # If we get here, no order was placed
         return None, {"status": "success", "message": response_msg or "No action needed"}, None
 
+    except PositionReadError:
+        raise
     except Exception as e:
         error_msg = f"Error in _place_smartorder_locked_ibulls: {str(e)}"
         logger.exception(error_msg)
@@ -405,17 +445,33 @@ def close_all_positions(current_api_key, auth):
         logger.debug(f"Exchange Segment: {exchange_segment}")
         logger.debug(f"Exchange Instrument ID: {instrument_id}")
 
+        # A square-off is a MARKET order, so it is priced with the same
+        # protection as one placed through the API. A position whose symbol
+        # cannot be resolved goes out as MARKET, as it did before.
+        order_type, limit_price = "MARKET", "0"
+        exchange = _SEGMENT_EXCHANGE.get(exchange_segment)
+        try:
+            symbol = get_symbol(str(instrument_id), exchange) if exchange else None
+            if symbol:
+                order_type, limit_price = protected_order_type(
+                    {"symbol": symbol, "exchange": exchange, "action": action, "pricetype": "MARKET"},
+                    auth,
+                )
+        except Exception:
+            # Never let pricing stop a square-off: send it as MARKET.
+            logger.exception(f"Could not price the square-off of {exchange_segment}:{instrument_id}")
+
         # Prepare the order payload
         place_order_payload = {
             "exchangeSegment": exchange_segment,
             "exchangeInstrumentID": instrument_id,
             "productType": position["ProductType"],
-            "orderType": "MARKET",
+            "orderType": order_type,
             "orderSide": action,
             "timeInForce": "DAY",
             "disclosedQuantity": "0",
             "orderQuantity": str(quantity),
-            "limitPrice": "0",
+            "limitPrice": limit_price,
             "stopPrice": "0",
             "orderUniqueIdentifier": "openalgo",
         }
@@ -475,11 +531,14 @@ def modify_order(data, auth):
     client = get_httpx_client()
 
     token = get_token(data["symbol"], data["exchange"])
+    # Priced while data still holds the OpenAlgo symbol: the tick size and the
+    # LTP are looked up by it.
+    try:
+        transformed_data = transform_modify_order_data(data, token, auth)
+    except OrderFieldError as e:
+        logger.info(f"Modify not sent to Ibulls: {e}")
+        return {"status": "error", "message": str(e)}, 400
     data["symbol"] = get_br_symbol(data["symbol"], data["exchange"])
-
-    transformed_data = transform_modify_order_data(
-        data, token
-    )  # You need to implement this function
     # Set up the request headers
     headers = {
         "authorization": AUTH_TOKEN,

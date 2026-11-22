@@ -68,6 +68,7 @@ class WebSocketProxy:
         self.subscriptions = {}  # Maps client_id to set of subscriptions
         self.broker_adapters = {}  # Maps user_id to broker adapter
         self.user_mapping = {}  # Maps client_id to user_id
+        self._invalidated_clients = set()  # Sockets awaiting a credential-change close
         self.user_broker_mapping = {}  # Maps user_id to broker_name
         self.running = False
 
@@ -632,8 +633,14 @@ class WebSocketProxy:
             client_id: Client ID to clean up
         """
         self.clients.pop(client_id, None)
+        invalidated_clients = getattr(self, "_invalidated_clients", None)
+        invalidated = invalidated_clients is not None and client_id in invalidated_clients
+        if invalidated_clients is not None:
+            invalidated_clients.discard(client_id)
         user_id = self.user_mapping.get(client_id)
-        adapter = self.broker_adapters.get(user_id) if user_id else None
+        # A replacement adapter may already exist for this user. The old socket
+        # never owned subscriptions on that adapter.
+        adapter = self.broker_adapters.get(user_id) if user_id and not invalidated else None
         release_failed = False
 
         parsed_subscriptions, rows_by_key = self._indexed_client_subscriptions(client_id)
@@ -1856,10 +1863,24 @@ class WebSocketProxy:
                     f"Error cleaning connection pools for user {user_id}: {pool_error}"
                 )
 
+            # Existing sockets still consider themselves authenticated, but their
+            # broker adapter has just been removed. Close them so clients can
+            # authenticate again with the new broker credentials.
+            for client_id, websocket in list(self.clients.items()):
+                if self.user_mapping.get(client_id) == user_id:
+                    self._invalidated_clients.add(client_id)
+                    aio.create_task(self._close_invalidated_client(client_id, websocket))
+
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse cache invalidation message: {e}")
         except Exception as e:
             logger.exception(f"Error processing cache invalidation: {e}")
+
+    async def _close_invalidated_client(self, client_id, websocket):
+        try:
+            await websocket.close(code=1012, reason="Broker credentials changed")
+        except Exception:
+            logger.exception("Error closing invalidated client %s", client_id)
 
     async def _handle_order_update(self, data_str: str):
         """
@@ -1933,24 +1954,13 @@ class WebSocketProxy:
             user_id: The user's ID
         """
         try:
-            from database.auth_db import (
-                auth_cache,
-                broker_cache,
-                feed_token_cache,
-            )
+            from database.auth_db import broker_cache, invalidate_user_auth_cache
 
             cache_key_auth = f"auth-{user_id}"
-            cache_key_feed = f"feed-{user_id}"
 
-            caches_cleared = []
-            if cache_key_auth in auth_cache:
-                del auth_cache[cache_key_auth]
-                caches_cleared.append("auth_cache")
-            if cache_key_feed in feed_token_cache:
-                del feed_token_cache[cache_key_feed]
-                caches_cleared.append("feed_token_cache")
-            if cache_key_auth in broker_cache:
-                del broker_cache[cache_key_auth]
+            # One call per cache, never a membership test then a delete.
+            caches_cleared = invalidate_user_auth_cache(user_id)
+            if broker_cache.pop(cache_key_auth, None) is not None:
                 caches_cleared.append("broker_cache")
 
             if caches_cleared:
@@ -2172,10 +2182,54 @@ class WebSocketProxy:
                 await aio.sleep(1)
 
 
+#: Set by the app when it starts this process as a supervised child (gthread
+#: worker only): the pid of the worker that owns it.
+PARENT_PID_ENV = "OPENALGO_PROXY_PARENT_PID"
+ORPHAN_CHECK_SECONDS = 1.0
+
+
+def _expected_parent_pid() -> int | None:
+    """The owning worker's pid, when this child should exit once orphaned."""
+    if os.name != "posix":
+        return None
+    raw = os.environ.get(PARENT_PID_ENV, "").strip()
+    try:
+        pid = int(raw)
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+async def _exit_when_orphaned(proxy, parent_pid: int) -> None:
+    """Stop the proxy once the worker that started it has gone.
+
+    A worker killed hard (a worker timeout, or SIGKILL after the graceful
+    window) never runs its exit handlers, so nothing terminates this child.
+    Left running it would keep the WebSocket and ZeroMQ ports, and the next
+    worker's child would fail to bind them. When the parent dies the child is
+    re-parented, so a changed parent pid means it is time to go.
+    """
+    warned = False
+    while True:
+        await aio.sleep(ORPHAN_CHECK_SECONDS)
+        if os.getppid() == parent_pid:
+            continue
+        if not warned:
+            warned = True
+            logger.warning(
+                "The OpenAlgo web server that started live market data has "
+                "stopped; stopping this copy so the next one can start."
+            )
+        # Every check, not once: start() sets the flag when it begins, so a
+        # parent that died before that would otherwise be missed.
+        proxy.running = False
+
+
 # Entry point for running the server standalone
 async def main():
     """Main entry point for running the WebSocket proxy server"""
     proxy = None
+    orphan_watch = None
 
     try:
         # Load environment variables
@@ -2187,6 +2241,10 @@ async def main():
 
         # Create and start the WebSocket proxy
         proxy = WebSocketProxy(host=ws_host, port=ws_port)
+
+        parent_pid = _expected_parent_pid()
+        if parent_pid is not None:
+            orphan_watch = aio.create_task(_exit_when_orphaned(proxy, parent_pid))
 
         await proxy.start()
 
@@ -2206,6 +2264,8 @@ async def main():
         logger.exception(f"Server error: {e}")
         raise
     finally:
+        if orphan_watch is not None:
+            orphan_watch.cancel()
         # Always clean up resources
         if proxy:
             try:

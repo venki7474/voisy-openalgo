@@ -46,7 +46,7 @@ policy all come from the database.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -118,6 +118,13 @@ DEFAULT_TOOL_CALL_LIMIT = 25
 #: How many previous runs of the conversation are replayed into context.
 DEFAULT_NUM_HISTORY_RUNS = 8
 
+#: Most tool calls, with their results, replayed from those runs. agno keeps the
+#: newest and drops the rest in pairs, so the conversation's answers survive
+#: while a long tool-heavy thread stops re-sending every old payload, and a
+#: refused call from an earlier turn stops being shown to the model as an
+#: example to repeat.
+DEFAULT_MAX_TOOL_CALLS_FROM_HISTORY = 20
+
 #: Character budget for the system prompt. Generous, because trimming drops
 #: whole sections; the pinned security rules survive any budget.
 #:
@@ -140,7 +147,20 @@ DEFAULT_NUM_HISTORY_RUNS = 8
 #: only a log line. 30000 restores about two thousand characters of room. The
 #: cap is a ceiling and not a target, so raising it costs nothing until a
 #: section actually grows into it.
-DEFAULT_MAX_PROMPT_CHARS = 30000
+#:
+#: Raised again from 30000 when the voice surface began receiving the OpenUI
+#: Lang reference its render_ui tool points at (about 8.8k characters, taking
+#: voice to roughly 31k) and the tool-use section gained its date and retry
+#: rules (chat to roughly 29k). 34000 kept about three thousand characters of
+#: room above the largest configuration.
+#:
+#: Raised to 40000 when the skills and external data (MCP) sections joined:
+#: measured, chat renders 32956 characters and voice 32582, about a thousand
+#: under 34000, and each further skill in ``services/agent/skills/registry.py``
+#: adds roughly a thousand to every surface it is offered on. 40000 leaves room
+#: for several more before this has to move again; the budget tests in
+#: ``test_agent_openui_tool.py`` and ``test_agent_skills.py`` say when it does.
+DEFAULT_MAX_PROMPT_CHARS = 40000
 
 #: The operator's timezone. Indian markets, and every schedule in this platform,
 #: run on IST. This is not configuration, it is what the exchanges do.
@@ -509,14 +529,73 @@ def _register_chatgpt_models() -> None:
     unaffected either way. See `services/agent/chatgpt_models.py`.
     """
     try:
-        import litellm
+        from services.agent import chatgpt_models, litellm_loader
 
-        from services.agent import chatgpt_models
+        litellm = litellm_loader.load()
 
         chatgpt_models.register(litellm)
         chatgpt_models.quieten_usage_warning()
     except Exception:
         logger.exception("Could not register the supplemental ChatGPT models")
+    # Under eventlet, LiteLLM's sync-to-async hops must run on a real thread or
+    # a streamed answer can fail part way (#2081). A no-op on gthread and the
+    # development server.
+    from services.agent import litellm_eventlet, litellm_tool_args
+
+    litellm_eventlet.install()
+    # Parallel tool calls over the Responses bridge can arrive with their
+    # arguments only in the closing event, which LiteLLM drops; without this a
+    # question naming two instruments fails every call in the batch.
+    litellm_tool_args.install()
+
+
+#: Providers whose API takes explicit cache breakpoints for Claude models. A
+#: model on any other provider either caches on its own (OpenAI) or has no cache,
+#: and a ``cache_control`` field sent to one that does not know it can be refused,
+#: so nothing is injected for them.
+_PROMPT_CACHE_PROVIDERS = frozenset({"anthropic", "bedrock", "vertex_ai", "openrouter"})
+
+
+def prompt_cache_points(litellm_id: str) -> list[dict[str, Any]]:
+    """The cache breakpoints to inject for one model, or none.
+
+    Every model call in a turn re-sends the same tool definitions and system
+    prompt (about 47,000 tokens), and a turn that searches and reads a page makes
+    several calls. A cache breakpoint lets the provider read that prefix back at a
+    fraction of the price and time instead of processing it again.
+
+    Anthropic reads its prefix in the order tools, system, messages, and a
+    breakpoint caches everything before it, so three are used:
+
+    * on the tool definitions, about 80 percent of the block and the part that
+      almost never changes, so it stays cached even when the system prompt text
+      moves on (the clock changes it every minute, see
+      ``prompts.volatile_section``);
+    * on the system message, which adds the prompt itself when it is unchanged;
+    * on the last message, so each later call in the turn reuses everything the
+      call before it already sent, the tool results included.
+
+    LiteLLM injects them and enforces the provider's four-breakpoint limit.
+
+    Args:
+        litellm_id: The id LiteLLM is addressed with, such as
+            ``anthropic/claude-haiku-5-5``.
+
+    Returns:
+        The injection points for a Claude model on a provider that takes them,
+        otherwise an empty list.
+    """
+    name = (litellm_id or "").strip().lower()
+    provider = name.split("/", 1)[0]
+    if provider not in _PROMPT_CACHE_PROVIDERS:
+        return []
+    if provider != "anthropic" and "claude" not in name and "anthropic" not in name:
+        return []
+    return [
+        {"location": "tool_config"},
+        {"location": "message", "role": "system"},
+        {"location": "message", "index": -1},
+    ]
 
 
 def build_model(resolved: ResolvedModel, *, reasoning_effort: str | None = None) -> LiteLLM:
@@ -575,7 +654,20 @@ def build_model(resolved: ResolvedModel, *, reasoning_effort: str | None = None)
 
     effort = _reasoning_effort(resolved, reasoning_effort)
     if effort:
-        kwargs["request_params"] = {"reasoning_effort": effort}
+        kwargs.setdefault("request_params", {})["reasoning_effort"] = effort
+
+    # LiteLLM's own opt-out from its MCP gateway. With tools set (every agent
+    # turn) completion() otherwise imports the gateway, which needs the mcp 2
+    # SDK while OpenAlgo pins mcp 1.30, and every turn fails with "cannot import
+    # name 'CacheableResult'". The agent runs its MCP servers itself and hands
+    # LiteLLM plain function tools, so the gateway has nothing to do here. The
+    # Responses path reads this flag too late; services/agent/litellm_mcp_gateway
+    # covers it.
+    kwargs.setdefault("request_params", {})["_skip_mcp_handler"] = True
+
+    cache_points = prompt_cache_points(resolved.litellm_id)
+    if cache_points:
+        kwargs.setdefault("request_params", {})["cache_control_injection_points"] = cache_points
 
     kwargs["name"] = resolved.display_name
 
@@ -597,10 +689,11 @@ def build_model(resolved: ResolvedModel, *, reasoning_effort: str | None = None)
         agent_db.mark_secret_used(resolved.secret_name)
 
     logger.info(
-        "Agent model resolved: %s (%s, reasoning=%s)",
+        "Agent model resolved: %s (%s, reasoning=%s, prompt cache=%s)",
         resolved.display_name,
         resolved.litellm_id,
         effort or "off",
+        "on" if cache_points else "off",
     )
     return model
 
@@ -738,12 +831,76 @@ def build_session_state(context: ToolContext, **extra: Any) -> dict[str, Any]:
         # state, so a turn sent with search off cannot get the search tools
         # handed to it when the operator approves a pending order.
         "web_search_enabled": bool(context.web_search_enabled),
+        # Resolved here, in the request, so the tool factory on the agent's
+        # thread reads a boolean rather than the database.
+        "mcp_enabled": _effective_mcp_enabled(context.mcp_enabled, context.surface),
         "analyzer_mode": bool(context.analyzer_mode),
         "conversation_id": context.conversation_id,
         "user_id": context.user_id,
     }
     state.update(extra)
     return state
+
+
+def _effective_mcp_enabled(context_flag: Any, surface: str) -> bool:
+    """Combine the run's MCP flag with the operator's ``mcp_enabled`` setting.
+
+    A surface with no registered server gets neither the toolkit nor its prompt
+    section, whatever the switch says: two tools that can only answer "no such
+    server" would cost every turn their schema for nothing. Checked first, so
+    that case reads no setting at all.
+
+    Args:
+        context_flag: The value the surface put on the context.
+        surface: The run's surface.
+
+    Returns:
+        True only when a server is registered for the surface and both the run
+        and the operator allow the external data servers.
+    """
+    from services.agent.mcp.registry import servers_for_surface
+
+    if not bool(context_flag) or not servers_for_surface(surface):
+        return False
+    try:
+        return bool(settings.is_mcp_enabled(fresh=True))
+    except Exception:
+        logger.exception("Could not read the agent MCP setting; withholding the MCP tools")
+        return False
+
+
+def _mcp_section(surface: str, state: Mapping[str, Any]) -> prompts.PromptSection | None:
+    """The MCP prompt section, when this run is offered the MCP toolkit.
+
+    Args:
+        surface: The run's surface.
+        state: The session state just built, which carries ``mcp_enabled``.
+
+    Returns:
+        The section, or None when the toolkit is withheld from this run.
+    """
+    if not state.get("mcp_enabled"):
+        return None
+    from services.agent.mcp.prompt import mcp_prompt_section
+
+    return mcp_prompt_section(surface)
+
+
+def _web_section(state: Mapping[str, Any]) -> prompts.PromptSection | None:
+    """The web sources section, when this run is offered the web tools.
+
+    Args:
+        state: The session state just built, which carries ``web_search_enabled``.
+
+    Returns:
+        The section, or None when the web tools are withheld or no source is
+        preferred.
+    """
+    if not state.get("web_search_enabled"):
+        return None
+    from services.agent.web_prompt import web_prompt_section
+
+    return web_prompt_section(settings.get_preferred_sources())
 
 
 def _effective_trading_enabled(session_flag: Any) -> bool:
@@ -818,6 +975,13 @@ def tool_factory(context: ToolContext) -> Callable[..., list[Any]]:
                 state.get("trading_enabled", context.trading_enabled)
             ),
             web_search_enabled=bool(state.get("web_search_enabled", context.web_search_enabled)),
+            # The context carries the value build_session_state already ANDed
+            # with the operator's setting (see build_agent), so falling back to
+            # it reads no database here. agno's run state does not carry these
+            # keys: defaulting to False here withheld the MCP tools from every
+            # real run while the toolkit tests, which call the factory
+            # directly, passed.
+            mcp_enabled=bool(state.get("mcp_enabled", context.mcp_enabled)),
             run_id=run_context_id,
             session_id=session_id,
             extras=context.extras,
@@ -879,6 +1043,7 @@ def build_agent(
             and an HTTP status.
     """
     agent_cls, _litellm_cls, _db_cls = _require_agno()
+    from services.agent import tool_guard
 
     requested = model_id if model_id is not None else context.extras.get("model_id")
     resolved = resolve_model(requested)
@@ -895,13 +1060,48 @@ def build_agent(
     model = build_model(resolved, reasoning_effort=reasoning_effort)
 
     state = build_session_state(context)
+
+    # The skills offered on this surface, read from disk on every build so an
+    # edited SKILL.md applies on the next message. Placed before the caller's
+    # sections so one of theirs with the same key still wins. A skill that
+    # cannot be read costs its own line, never the run.
+    skill_sections: list[prompts.PromptSection] = []
+    try:
+        from services.agent.skills.prompt import skills_section
+
+        section = skills_section(context.surface)
+        if section is not None:
+            skill_sections.append(section)
+    except Exception:
+        logger.exception("The agent skills section could not be built; continuing without it")
+
+    # The external data servers, taught only to a run that is offered the MCP
+    # toolkit. Generated from the registry; no network work.
+    mcp_sections: list[prompts.PromptSection] = []
+    try:
+        section = _mcp_section(context.surface, state)
+        if section is not None:
+            mcp_sections.append(section)
+    except Exception:
+        logger.exception("The agent MCP section could not be built; continuing without it")
+
+    # Where company figures are looked for first, taught only to a run that is
+    # offered the web tools.
+    web_sections: list[prompts.PromptSection] = []
+    try:
+        web_section = _web_section(state)
+        if web_section is not None:
+            web_sections.append(web_section)
+    except Exception:
+        logger.exception("The agent web sources section could not be built; continuing without it")
+
     system_prompt = prompts.build_system_prompt(
         surface=context.surface,
         trading_enabled=bool(state["trading_enabled"]),
         analyzer_mode=bool(state["analyzer_mode"]),
         now=now or datetime.now(IST),
         override=settings.get_system_prompt_override(),
-        extra_sections=extra_sections,
+        extra_sections=[*skill_sections, *mcp_sections, *web_sections, *extra_sections],
         extra_runtime_lines=extra_runtime_lines,
         max_chars=max_prompt_chars,
     )
@@ -923,13 +1123,20 @@ def build_agent(
         # The extension seam: a callable, so agno re-evaluates tool availability
         # per run from run_context.session_state rather than freezing the list
         # the agent was built with.
-        tools=tool_factory(context),
+        # The factory falls back to this context where agno's run state lacks a
+        # key, so it is handed the effective MCP flag, already ANDed with the
+        # operator's switch, rather than the request's own ask.
+        tools=tool_factory(replace(context, mcp_enabled=bool(state["mcp_enabled"]))),
         # Tool availability is a security control, so it is never served from a
         # cache keyed on the user id.
         cache_callables=False,
         tool_call_limit=tool_call_limit,
         add_history_to_context=True,
         num_history_runs=num_history_runs,
+        max_tool_calls_from_history=DEFAULT_MAX_TOOL_CALLS_FROM_HISTORY,
+        # Outermost on every tool: a call whose arguments pydantic refuses comes
+        # back to the model as a named correction rather than pydantic's text.
+        tool_hooks=[tool_guard.argument_guard],
         markdown=True,
         # A verbatim system message, so the anti-injection rule is first and
         # stays first. Agno composes its own message from description and

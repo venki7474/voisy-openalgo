@@ -48,8 +48,8 @@ Data       getQuote · multiQuotes · getDepth · history · indicator ·
            symbol · optionSymbol · expiry · intervals · optionChain ·
            syntheticFuture · holidays · timings · calendar
 Streaming  subscribeLtp · subscribeQuote · subscribeDepth · unsubscribe
-Utility    log · telegramAlert · whatsappAlert · variable · mathExpression ·
-           httpRequest · delay · waitUntil · group
+Utility    log · telegramAlert · whatsappAlert · slackAlert · discordAlert ·
+           variable · mathExpression · httpRequest · delay · waitUntil · group
 ```
 
 ### Capabilities Flow does NOT have
@@ -852,8 +852,10 @@ underlying always wins, so a workflow whose `exchange` still holds the node
 default cannot misroute a SENSEX or CRUDEOIL order.
 
 `quantity` is in **lots** for every underlying. The lot size comes from the
-master contract, and most MCX option contracts carry a lot size of 1, so one lot
-is one contract there.
+master contract, so one lot of CRUDEOIL is 100 barrels on every broker. Kite
+reports `lot_size = 1` for MCX because it counts order quantity in contracts;
+`broker/zerodha` writes the real lot and converts at its own API boundary, so
+nothing here has to know that.
 
 #### optionsMultiOrder - Multi-Leg Options Strategy
 
@@ -1751,6 +1753,48 @@ Sends a WhatsApp message via the paired bot device. Requires pairing from the
   "type": "whatsappAlert",
   "position": { "x": 100, "y": 300 },
   "data": { "to": "", "message": "Order placed: {{ord.orderid}}" }
+}
+```
+
+#### slackAlert - Slack Alert
+
+Posts to the Slack incoming webhook saved on the `/slack` page. Slack must be
+switched on at `/alerts`; otherwise the node fails and the run log names the
+missing step. There is no recipient field: the webhook decides the channel. The
+post is queued, so the node does not wait for Slack. A message over 4000
+characters (counted before Slack escapes `&`, `<` and `>`) is shortened to
+fit, ending in `...`.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `message` | string | - | Supports `{{vars}}`. |
+
+```json
+{
+  "id": "node_3",
+  "type": "slackAlert",
+  "position": { "x": 100, "y": 300 },
+  "data": { "message": "Order placed: {{ord.orderid}}" }
+}
+```
+
+#### discordAlert - Discord Alert
+
+Posts to the Discord webhook saved on the `/discord` page, under the same rules
+as `slackAlert`: Discord switched on at `/alerts`, no recipient field, queued.
+A message over 2000 characters is shortened to fit. Mentions are never
+resolved, so `@everyone` in a message pings nobody.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `message` | string | - | Supports `{{vars}}`. |
+
+```json
+{
+  "id": "node_3",
+  "type": "discordAlert",
+  "position": { "x": 100, "y": 300 },
+  "data": { "message": "Order placed: {{ord.orderid}}" }
 }
 ```
 
@@ -2708,7 +2752,8 @@ funds (outputVariable=f)
   accept `quantity` **in shares**. Check this when generating from a single
   source. The lot size is read from the master contract, never guessed: an
   underlying with no usable lot size fails the node rather than sizing an order
-  on an assumption. Most MCX option contracts carry a lot size of 1.
+  on an assumption. MCX carries its real market lot on every broker, including
+  Zerodha, whose adapter converts to Kite's contract count on the way out.
 
 ---
 

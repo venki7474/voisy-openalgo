@@ -14,8 +14,9 @@ import os
 import sys
 import threading
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
-from typing import Dict, List, Optional, Set
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -24,9 +25,91 @@ from database.sandbox_db import SandboxOrders, db_session
 from services.market_data_service import get_market_data_service
 from services.websocket_service import subscribe_to_symbols, unsubscribe_from_symbols
 from utils import real_threading as _real_threading
+from utils.db_sessions import session_cleanup
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Feed subscribe and unsubscribe calls never run on the caller. They are made
+# from the order path (placing, cancelling and filling an order, opening and
+# closing a position, placing a GTT), and each one reads the database and then
+# waits up to 12 seconds for the websocket proxy to acknowledge. Inline, that
+# wait was added to the order response although the order needs none of it.
+#
+# Each call is appended to _feed_calls while the engine's lock is still held,
+# in the same hold as the refcount change that decided it, so the queue order
+# is the refcount order: a place and a cancel racing on two threads can never
+# queue the cancel's unsubscribe ahead of the place's subscribe. Queueing
+# never waits on I/O (it takes only _feed_lock, which nothing holds across a
+# call), which is what makes it safe under that real lock; submitting to the
+# executor can (its first submit starts the worker thread), so that happens
+# after the release, in _start_feed_calls(). One worker drains the
+# queue in order. It is shared by every engine instance, so order also holds
+# across a stop and a start, and it is a plain executor thread: green under
+# eventlet, like the callers that feed it.
+#
+# While the proxy is not answering, the worker spends up to 12 seconds on each
+# call, and the order path no longer waits for any of them. Without a bound
+# the queue would then grow with every order. An unsubscribe therefore cancels
+# its symbol's subscribe if that subscribe has not started yet (see
+# _queue_feed_call), so no symbol ever has more than two calls waiting.
+_feed_calls: deque = deque()
+# Guards _feed_calls between callers, which look back along it to cancel a
+# waiting subscribe, and the worker, which takes from the front. A real lock,
+# held only for in-memory list work: never across a feed call, a log line or
+# anything else that can yield.
+_feed_lock = _real_threading.Lock()
+_feed_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sandbox-feed-subscribe")
+
+
+def _queue_feed_call(kind, call, user_id, symbols):
+    """Queue a feed subscribe or unsubscribe. Call while holding the engine's lock.
+
+    An unsubscribe for one symbol cancels that symbol's subscribe while the
+    subscribe is still waiting: neither reaches the proxy, and the symbol ends
+    unsubscribed, as it would have. Only that pair is cancelled. An
+    unsubscribe followed by a subscribe is always kept, because the subscribe
+    before that unsubscribe may have failed, and the new one is then the only
+    one that will reach the proxy. Calls for several symbols at once (the index
+    rebuild, a stop) are never cancelled and never cancel anything.
+    """
+    symbols = list(symbols)
+    with _feed_lock:
+        if kind == "unsubscribe" and len(symbols) == 1:
+            for index in range(len(_feed_calls) - 1, -1, -1):
+                queued_kind, _, queued_user, queued_symbols = _feed_calls[index]
+                if queued_user != user_id or symbols[0] not in queued_symbols:
+                    continue
+                if queued_kind == "subscribe" and len(queued_symbols) == 1:
+                    del _feed_calls[index]
+                    return
+                break
+        _feed_calls.append((kind, call, user_id, symbols))
+
+
+def _drain_feed_calls():
+    """Run every queued feed call, oldest first. Runs on the feed worker."""
+    while True:
+        with _feed_lock:
+            if not _feed_calls:
+                return
+            _, call, user_id, symbols = _feed_calls.popleft()
+        try:
+            with session_cleanup():
+                call(user_id, symbols)
+        except Exception:
+            logger.exception(f"Feed subscription call failed for user {user_id}")
+
+
+def _start_feed_calls():
+    """Have the feed worker run what has been queued. Call after releasing the lock."""
+    if not _feed_calls:
+        return
+    try:
+        _feed_executor.submit(_drain_feed_calls)
+    except RuntimeError:
+        # The interpreter is exiting, and the proxy goes with it.
+        logger.debug("Feed subscription calls not run: the process is shutting down")
 
 
 class WebSocketExecutionEngine:
@@ -40,13 +123,17 @@ class WebSocketExecutionEngine:
         self._subscriber_id: str | None = None
         self._running = False
         # A REAL lock, not eventlet's green semaphore. _on_market_data()
-        # takes it on the websocket client's asyncio loop thread (a real OS
-        # thread) while notify_order_placed(), notify_position_opened() and
-        # the rest take it from greenlets on the request path. Contended
-        # across that boundary a green semaphore wedges the loop thread for
-        # good, which stops every tick this engine needs to trigger pending
-        # SL, LIMIT and GTT orders. Both sections it guards only copy out of
-        # a dict; the database work deliberately happens after the release.
+        # takes it on the websocket client's dispatch thread, which drains the
+        # client's queue: a greenlet under eventlet, and a real OS thread under
+        # the gthread worker and the dev server, running truly in parallel
+        # with requests there. notify_order_placed(), notify_position_opened()
+        # and the rest take it from request threads (greenlets under
+        # eventlet). A real lock is correct on every side of that boundary,
+        # where a green one taken from a real thread would wedge it for good
+        # and stop every tick this engine needs to trigger pending SL, LIMIT
+        # and GTT orders. Both sections it guards only copy out of a dict; the
+        # database work deliberately happens after the release, because a
+        # greenlet that waits on a real lock blocks the whole eventlet hub.
         self._lock = _real_threading.Lock()
 
         # Index of pending orders by symbol key (exchange:symbol)
@@ -137,9 +224,16 @@ class WebSocketExecutionEngine:
         self._unsubscribe_all_ws()
 
     def _rebuild_order_index(self):
-        """Build index of pending orders from database"""
-        subscriptions_to_add: dict[str, list[tuple[str, str]]] = {}
+        """Build index of pending orders from database
 
+        The database is read before self._lock is taken, and the lock is then
+        held only to merge the result into the index. self._lock is a real
+        lock: a greenlet holding it across a statement that waits in the
+        database's lock-retry loop yields to the hub while holding it, and the
+        next greenlet to want it (an order being placed) then blocks the hub
+        thread for good. Anything notified while the rebuild was reading is
+        kept, not wiped by the merge.
+        """
         with self._lock:
             self._pending_orders_index.clear()
             self._pending_gtt_index.clear()
@@ -147,112 +241,125 @@ class WebSocketExecutionEngine:
             self._user_symbol_refcounts.clear()
             self._position_refs.clear()
 
-            try:
-                # "open" (resting in the regular book) and "trigger pending"
-                # (SL/SL-M resting in the Stop-Loss book) both need tick
-                # monitoring for their respective price conditions.
-                pending_orders = SandboxOrders.query.filter(
-                    SandboxOrders.order_status.in_(["open", "trigger pending"])
-                ).all()
+        try:
+            order_entries, gtt_entries, position_entries = self._read_index_sources()
+        except Exception as e:
+            logger.exception(f"Error building order index: {e}")
+            return
 
-                for order in pending_orders:
-                    # Skip orders on expired F&O contracts: the symbol is gone
-                    # from the master contract after the daily refresh, so
-                    # subscribing it just makes the broker adapter log
-                    # token-lookup errors on every boot ("No brsymbol found").
-                    # Cancellation (with margin release) is handled by the
-                    # square-off cycle's _cancel_expired_contract_orders --
-                    # deliberately NOT done here, since cancel_order re-enters
-                    # this engine via notify_order_completed and would deadlock
-                    # on self._lock.
-                    from datetime import date
+        subscriptions_to_add: dict[str, list[tuple[str, str]]] = {}
 
-                    from sandbox.position_manager import get_contract_expiry
+        def first_reference(user_id, symbol_key):
+            if self._increment_user_symbol_refcount(user_id, symbol_key):
+                exchange, symbol = symbol_key.split(":", 1)
+                subscriptions_to_add.setdefault(user_id, []).append((symbol, exchange))
 
-                    expiry_date = get_contract_expiry(order.symbol, order.exchange)
-                    if expiry_date is not None and date.today() > expiry_date:
-                        logger.info(
-                            f"Skipping WS subscription for {order.symbol}: contract "
-                            f"expired {expiry_date}; order {order.orderid} awaits auto-cancel"
-                        )
-                        continue
+        pos_subscribed = 0
+        with self._lock:
+            for symbol_key, orderid, user_id in order_entries:
+                bucket = self._pending_orders_index.setdefault(symbol_key, [])
+                self._monitored_symbols.add(symbol_key)
+                if orderid in bucket:
+                    continue  # placed and notified while the rebuild was reading
+                bucket.append(orderid)
+                first_reference(user_id, symbol_key)
 
-                    symbol_key = f"{order.exchange}:{order.symbol}"
-                    if symbol_key not in self._pending_orders_index:
-                        self._pending_orders_index[symbol_key] = []
-                    self._pending_orders_index[symbol_key].append(order.orderid)
-                    self._monitored_symbols.add(symbol_key)
-                    self._increment_user_symbol_refcount(order.user_id, symbol_key)
+            for symbol_key, leg_id, user_id in gtt_entries:
+                legs = self._pending_gtt_index.setdefault(symbol_key, [])
+                self._monitored_symbols.add(symbol_key)
+                if leg_id in legs:
+                    continue  # placed and notified while the rebuild was reading
+                legs.append(leg_id)
+                first_reference(user_id, symbol_key)
 
-                # Resting GTTs need tick monitoring exactly like resting orders,
-                # and are frequently the only thing in the book - a user with no
-                # open orders but an active GTT must still be subscribed.
-                from sandbox import gtt_manager
+            for user_id, key in position_entries:
+                if (user_id, key) not in self._position_refs:
+                    self._position_refs.add((user_id, key))
+                    first_reference(user_id, key)
+                    pos_subscribed += 1
 
-                gtt_legs = gtt_manager.get_active_legs()
-                for leg, gtt in gtt_legs:
-                    symbol_key = f"{gtt.exchange}:{gtt.symbol}"
-                    self._pending_gtt_index.setdefault(symbol_key, []).append(leg.id)
-                    self._monitored_symbols.add(symbol_key)
-                    self._increment_user_symbol_refcount(gtt.user_id, symbol_key)
+            monitored = len(self._monitored_symbols)
+            for user_id, symbols in subscriptions_to_add.items():
+                self._queue_subscribe(user_id, symbols)
 
-                logger.debug(
-                    f"Built order index: {len(pending_orders)} orders and "
-                    f"{len(gtt_legs)} GTT legs across "
-                    f"{len(self._monitored_symbols)} symbols"
+        logger.debug(
+            f"Built order index: {len(order_entries)} orders and "
+            f"{len(gtt_entries)} GTT legs across "
+            f"{monitored} symbols"
+        )
+        if pos_subscribed:
+            logger.info(f"Position feed: {pos_subscribed} open-position symbols added to index")
+
+        _start_feed_calls()
+
+    @staticmethod
+    def _read_index_sources():
+        """Read what the index is built from: pending orders, GTT legs, open positions.
+
+        Returns:
+            ``(orders, gtt_legs, positions)``: lists of
+            ``(symbol_key, orderid, user_id)``, ``(symbol_key, leg_id, user_id)``
+            and ``(user_id, symbol_key)``.
+        """
+        from datetime import date
+
+        from database.sandbox_db import SandboxPositions
+        from sandbox import gtt_manager
+        from sandbox.position_manager import get_contract_expiry
+
+        # "open" (resting in the regular book) and "trigger pending"
+        # (SL/SL-M resting in the Stop-Loss book) both need tick
+        # monitoring for their respective price conditions.
+        pending_orders = SandboxOrders.query.filter(
+            SandboxOrders.order_status.in_(["open", "trigger pending"])
+        ).all()
+
+        orders = []
+        for order in pending_orders:
+            # Skip orders on expired F&O contracts: the symbol is gone
+            # from the master contract after the daily refresh, so
+            # subscribing it just makes the broker adapter log
+            # token-lookup errors on every boot ("No brsymbol found").
+            # Cancellation (with margin release) is handled by the
+            # square-off cycle's _cancel_expired_contract_orders --
+            # deliberately NOT done here, since cancel_order re-enters
+            # this engine via notify_order_completed and would deadlock
+            # on self._lock.
+            expiry_date = get_contract_expiry(order.symbol, order.exchange)
+            if expiry_date is not None and date.today() > expiry_date:
+                logger.info(
+                    f"Skipping WS subscription for {order.symbol}: contract "
+                    f"expired {expiry_date}; order {order.orderid} awaits auto-cancel"
                 )
+                continue
+            orders.append((f"{order.exchange}:{order.symbol}", order.orderid, order.user_id))
 
-                # Event-driven MTM: open positions hold feed subscriptions too,
-                # so a restart re-warms MarketDataService for every held symbol
-                # (the poll loop then reads ticks instead of REST-fetching).
-                # Contracts already past expiry are skipped -- their positions
-                # are awaiting settlement, and the symbol may already be gone
-                # from the master contract.
-                from datetime import date
+        # Resting GTTs need tick monitoring exactly like resting orders,
+        # and are frequently the only thing in the book - a user with no
+        # open orders but an active GTT must still be subscribed.
+        legs = [
+            (f"{gtt.exchange}:{gtt.symbol}", leg.id, gtt.user_id)
+            for leg, gtt in gtt_manager.get_active_legs()
+        ]
 
-                from database.sandbox_db import SandboxPositions
-                from sandbox.position_manager import get_contract_expiry
+        # Event-driven MTM: open positions hold feed subscriptions too,
+        # so a restart re-warms MarketDataService for every held symbol
+        # (the poll loop then reads ticks instead of REST-fetching).
+        # Contracts already past expiry are skipped -- their positions
+        # are awaiting settlement, and the symbol may already be gone
+        # from the master contract.
+        positions = []
+        for pos in SandboxPositions.query.filter(SandboxPositions.quantity != 0).all():
+            expiry = get_contract_expiry(pos.symbol, pos.exchange)
+            if expiry is not None and date.today() > expiry:
+                continue
+            positions.append((pos.user_id, f"{pos.exchange}:{pos.symbol}"))
 
-                open_positions = SandboxPositions.query.filter(
-                    SandboxPositions.quantity != 0
-                ).all()
-                pos_subscribed = 0
-                for pos in open_positions:
-                    expiry = get_contract_expiry(pos.symbol, pos.exchange)
-                    if expiry is not None and date.today() > expiry:
-                        continue
-                    key = f"{pos.exchange}:{pos.symbol}"
-                    if (pos.user_id, key) not in self._position_refs:
-                        self._position_refs.add((pos.user_id, key))
-                        self._increment_user_symbol_refcount(pos.user_id, key)
-                        pos_subscribed += 1
-                if pos_subscribed:
-                    logger.info(
-                        f"Position feed: {pos_subscribed} open-position symbols added to index"
-                    )
-
-            except Exception as e:
-                logger.exception(f"Error building order index: {e}")
-                return
-
-            # Build subscriptions per user (outside lock)
-            for user_id, symbols in self._user_symbol_refcounts.items():
-                new_symbols = []
-                for symbol_key in symbols:
-                    exchange, symbol = symbol_key.split(":", 1)
-                    new_symbols.append((symbol, exchange))
-                if new_symbols:
-                    subscriptions_to_add[user_id] = new_symbols
-
-        # Subscribe for all users
-        for user_id, symbols in subscriptions_to_add.items():
-            self._subscribe_ws_symbols(user_id, symbols)
+        return orders, legs, positions
 
     def notify_order_placed(self, order):
         """Called when a new order is placed to update the index"""
         symbol_key = f"{order.exchange}:{order.symbol}"
-        subscribe_user = None
-        subscribe_symbol = None
 
         with self._lock:
             if symbol_key not in self._pending_orders_index:
@@ -265,18 +372,12 @@ class WebSocketExecutionEngine:
 
             # Increment refcount and decide if we need to subscribe
             if self._increment_user_symbol_refcount(order.user_id, symbol_key):
-                subscribe_user = order.user_id
-                subscribe_symbol = symbol_key
+                self._queue_subscribe(order.user_id, [(order.symbol, order.exchange)])
 
-        if subscribe_user and subscribe_symbol:
-            exchange, symbol = subscribe_symbol.split(":", 1)
-            self._subscribe_ws_symbols(subscribe_user, [(symbol, exchange)])
+        _start_feed_calls()
 
     def notify_order_completed(self, order_id: str, symbol_key: str, user_id: str | None = None):
         """Called when an order is completed/cancelled to update the index"""
-        unsubscribe_user = None
-        unsubscribe_symbol = None
-
         with self._lock:
             if symbol_key and symbol_key in self._pending_orders_index:
                 if order_id in self._pending_orders_index[symbol_key]:
@@ -294,12 +395,10 @@ class WebSocketExecutionEngine:
             # Decrement refcount and decide if we should unsubscribe
             if user_id and symbol_key:
                 if self._decrement_user_symbol_refcount(user_id, symbol_key):
-                    unsubscribe_user = user_id
-                    unsubscribe_symbol = symbol_key
+                    exchange, symbol = symbol_key.split(":", 1)
+                    self._queue_unsubscribe(user_id, [(symbol, exchange)])
 
-        if unsubscribe_user and unsubscribe_symbol:
-            exchange, symbol = unsubscribe_symbol.split(":", 1)
-            self._unsubscribe_ws_symbols(unsubscribe_user, [(symbol, exchange)])
+        _start_feed_calls()
 
     def notify_position_opened(self, user_id: str, symbol: str, exchange: str):
         """Hold a feed subscription for an open position (event-driven MTM).
@@ -317,9 +416,11 @@ class WebSocketExecutionEngine:
             if (user_id, symbol_key) not in self._position_refs:
                 self._position_refs.add((user_id, symbol_key))
                 subscribe = self._increment_user_symbol_refcount(user_id, symbol_key)
+                if subscribe:
+                    self._queue_subscribe(user_id, [(symbol, exchange)])
         if subscribe:
             logger.info(f"Position feed: subscribing {symbol_key} for MTM (user {user_id})")
-            self._subscribe_ws_symbols(user_id, [(symbol, exchange)])
+            _start_feed_calls()
 
     def notify_position_closed(self, user_id: str, symbol: str, exchange: str):
         """Release the position's feed subscription once the symbol is flat.
@@ -335,9 +436,7 @@ class WebSocketExecutionEngine:
             from database.sandbox_db import SandboxPositions
 
             remaining = (
-                SandboxPositions.query.filter_by(
-                    user_id=user_id, symbol=symbol, exchange=exchange
-                )
+                SandboxPositions.query.filter_by(user_id=user_id, symbol=symbol, exchange=exchange)
                 .filter(SandboxPositions.quantity != 0)
                 .count()
             )
@@ -352,9 +451,11 @@ class WebSocketExecutionEngine:
             if (user_id, symbol_key) in self._position_refs:
                 self._position_refs.discard((user_id, symbol_key))
                 unsubscribe = self._decrement_user_symbol_refcount(user_id, symbol_key)
+                if unsubscribe:
+                    self._queue_unsubscribe(user_id, [(symbol, exchange)])
         if unsubscribe:
             logger.info(f"Position feed: releasing {symbol_key} (user {user_id}, flat)")
-            self._unsubscribe_ws_symbols(user_id, [(symbol, exchange)])
+            _start_feed_calls()
 
     def _on_market_data(self, data: dict):
         """
@@ -413,7 +514,9 @@ class WebSocketExecutionEngine:
                     self._drop_gtt_leg(symbol_key, leg_id, self._leg_user_id(leg))
                     continue
 
-                if not gtt_manager.leg_is_triggered_by(leg.trigger_direction, leg.trigger_price, ltp):
+                if not gtt_manager.leg_is_triggered_by(
+                    leg.trigger_direction, leg.trigger_price, ltp
+                ):
                     continue
 
                 if gtt_manager.try_claim_trigger(leg_id):
@@ -447,9 +550,6 @@ class WebSocketExecutionEngine:
         alive for a symbol nothing is watching any more, for the life of the
         process.
         """
-        unsubscribe_user = None
-        unsubscribe_symbol = None
-
         with self._lock:
             legs = self._pending_gtt_index.get(symbol_key)
             if legs and leg_id in legs:
@@ -460,12 +560,10 @@ class WebSocketExecutionEngine:
                     self._monitored_symbols.discard(symbol_key)
 
             if user_id and self._decrement_user_symbol_refcount(user_id, symbol_key):
-                unsubscribe_user = user_id
-                unsubscribe_symbol = symbol_key
+                exchange, symbol = symbol_key.split(":", 1)
+                self._queue_unsubscribe(user_id, [(symbol, exchange)])
 
-        if unsubscribe_user and unsubscribe_symbol:
-            exchange, symbol = unsubscribe_symbol.split(":", 1)
-            self._unsubscribe_ws_symbols(unsubscribe_user, [(symbol, exchange)])
+        _start_feed_calls()
 
     def notify_gtt_placed(self, gtt):
         """Start watching a newly placed GTT without waiting for a rebuild.
@@ -488,11 +586,11 @@ class WebSocketExecutionEngine:
                 # One ref per leg, matching the per-leg decrement on resolve.
                 if self._increment_user_symbol_refcount(gtt.user_id, symbol_key):
                     subscribe_user = gtt.user_id
+                    self._queue_subscribe(gtt.user_id, [(gtt.symbol, gtt.exchange)])
 
         if subscribe_user:
-            exchange, symbol = symbol_key.split(":", 1)
-            self._subscribe_ws_symbols(subscribe_user, [(symbol, exchange)])
-            logger.debug(f"Subscribed {symbol_key} for GTT {gtt.gtt_id}")
+            _start_feed_calls()
+            logger.debug(f"Subscribing {symbol_key} for GTT {gtt.gtt_id}")
 
     def _check_and_execute_order(self, order_id: str, ltp: Decimal):
         """
@@ -650,8 +748,25 @@ class WebSocketExecutionEngine:
             del self._pending_orders_index[symbol_key]
             self._monitored_symbols.discard(symbol_key)
 
+    def _queue_subscribe(self, user_id: str, symbols: list[tuple[str, str]]):
+        """Queue a feed subscribe. Call while holding self._lock.
+
+        Never waits; _start_feed_calls() runs it after the lock is released.
+        """
+        _queue_feed_call("subscribe", self._subscribe_ws_symbols, user_id, symbols)
+
+    def _queue_unsubscribe(self, user_id: str, symbols: list[tuple[str, str]]):
+        """Queue a feed unsubscribe. Call while holding self._lock.
+
+        Never waits; _start_feed_calls() runs it after the lock is released.
+        """
+        _queue_feed_call("unsubscribe", self._unsubscribe_ws_symbols, user_id, symbols)
+
     def _subscribe_ws_symbols(self, user_id: str, symbols: list[tuple[str, str]]):
-        """Subscribe to LTP via WebSocket for the given user and symbols."""
+        """Subscribe to LTP via WebSocket for the given user and symbols.
+
+        Runs on the feed worker, never on the order path; see _feed_calls.
+        """
         if not symbols:
             return
 
@@ -660,16 +775,12 @@ class WebSocketExecutionEngine:
 
             api_key = get_api_key_for_tradingview(user_id)
             if not api_key:
-                logger.warning(
-                    f"WebSocket subscribe skipped: no API key for user {user_id}"
-                )
+                logger.warning(f"WebSocket subscribe skipped: no API key for user {user_id}")
                 return
             broker = get_broker_name(api_key) if api_key else None
             broker_name = broker or "unknown"
             if broker_name == "unknown":
-                logger.warning(
-                    f"WebSocket subscribe may fail: unknown broker for user {user_id}"
-                )
+                logger.warning(f"WebSocket subscribe may fail: unknown broker for user {user_id}")
 
             symbol_payload = [{"symbol": s, "exchange": e} for s, e in symbols]
             success, response, status_code = subscribe_to_symbols(
@@ -683,7 +794,10 @@ class WebSocketExecutionEngine:
             logger.exception(f"Error subscribing WebSocket symbols for user {user_id}: {e}")
 
     def _unsubscribe_ws_symbols(self, user_id: str, symbols: list[tuple[str, str]]):
-        """Unsubscribe from LTP via WebSocket for the given user and symbols."""
+        """Unsubscribe from LTP via WebSocket for the given user and symbols.
+
+        Runs on the feed worker, never on the order path; see _feed_calls.
+        """
         if not symbols:
             return
 
@@ -692,16 +806,12 @@ class WebSocketExecutionEngine:
 
             api_key = get_api_key_for_tradingview(user_id)
             if not api_key:
-                logger.warning(
-                    f"WebSocket unsubscribe skipped: no API key for user {user_id}"
-                )
+                logger.warning(f"WebSocket unsubscribe skipped: no API key for user {user_id}")
                 return
             broker = get_broker_name(api_key) if api_key else None
             broker_name = broker or "unknown"
             if broker_name == "unknown":
-                logger.warning(
-                    f"WebSocket unsubscribe may fail: unknown broker for user {user_id}"
-                )
+                logger.warning(f"WebSocket unsubscribe may fail: unknown broker for user {user_id}")
 
             symbol_payload = [{"symbol": s, "exchange": e} for s, e in symbols]
             success, response, status_code = unsubscribe_from_symbols(
@@ -716,7 +826,6 @@ class WebSocketExecutionEngine:
 
     def _unsubscribe_all_ws(self):
         """Unsubscribe all WebSocket symbols for all users."""
-        users_to_unsub = []
         with self._lock:
             for user_id, symbols in self._user_symbol_refcounts.items():
                 symbol_list = []
@@ -724,11 +833,10 @@ class WebSocketExecutionEngine:
                     exchange, symbol = symbol_key.split(":", 1)
                     symbol_list.append((symbol, exchange))
                 if symbol_list:
-                    users_to_unsub.append((user_id, symbol_list))
+                    self._queue_unsubscribe(user_id, symbol_list)
             self._user_symbol_refcounts.clear()
 
-        for user_id, symbols in users_to_unsub:
-            self._unsubscribe_ws_symbols(user_id, symbols)
+        _start_feed_calls()
 
 
 # Global instance for singleton access
@@ -746,6 +854,17 @@ def get_websocket_execution_engine() -> WebSocketExecutionEngine:
         return _websocket_execution_engine
 
 
+def peek_websocket_execution_engine() -> WebSocketExecutionEngine | None:
+    """Return the engine if one exists, without ever creating one.
+
+    For callers that only want to tell a running engine something, such as a
+    fill announcing a position. Going through the get-or-create getter made
+    every fill in polling mode construct a dormant engine, and a fill landing
+    while the engine was being stopped create a fresh one nobody would start.
+    """
+    return _websocket_execution_engine
+
+
 def start_websocket_execution_engine():
     """Start the WebSocket execution engine"""
     engine = get_websocket_execution_engine()
@@ -757,12 +876,16 @@ def stop_websocket_execution_engine():
     """Stop the WebSocket execution engine"""
     global _websocket_execution_engine
 
+    # Detach it under the lock, stop it after: stop() joins the fallback
+    # thread for up to 10 seconds, and a fill on that thread asking whether
+    # the engine is running would otherwise wait out the whole join.
     with _engine_lock:
-        if _websocket_execution_engine:
-            _websocket_execution_engine.stop()
-            _websocket_execution_engine = None
-            return True, "WebSocket execution engine stopped"
-        return True, "WebSocket execution engine not running"
+        engine = _websocket_execution_engine
+        _websocket_execution_engine = None
+    if engine:
+        engine.stop()
+        return True, "WebSocket execution engine stopped"
+    return True, "WebSocket execution engine not running"
 
 
 def is_websocket_execution_engine_running() -> bool:
