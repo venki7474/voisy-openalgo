@@ -7,11 +7,14 @@
 # Trixie has security support to 2028-08-09 (LTS to 2030-06-30).
 FROM python:3.12-trixie AS python-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl build-essential && \
+    curl build-essential \
+    libopenblas-dev liblapack-dev gfortran && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY pyproject.toml .
-# create isolated virtual-env with uv, then add gunicorn and eventlet with compatible versions
+
+# Native UV install - UV will auto-detect ARM64
 RUN pip install --no-cache-dir uv && \
     uv venv .venv && \
     uv pip install --upgrade pip && \
@@ -56,10 +59,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN groupadd --gid 1000 appuser && \
     useradd --create-home --uid 1000 --gid 1000 appuser
 WORKDIR /app
-# 2 – copy the ready-made venv and source with correct ownership
+
+# 2 – Copy the ready-made venv and source
 COPY --from=python-builder --chown=appuser:appuser /app/.venv /app/.venv
 COPY --chown=appuser:appuser . .
-# 3 - copy built frontend from frontend-builder
+
+# 3 - Copy built frontend
 COPY --from=frontend-builder --chown=appuser:appuser /app/frontend/dist /app/frontend/dist
 # 4 – create required directories with proper ownership and permissions
 #     Also create empty .env file with write permissions for Railway deployment
